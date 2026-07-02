@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import json
 import math
 import os
 import random
@@ -9,9 +10,11 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
+import fitz
 from bson import ObjectId
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
@@ -22,8 +25,12 @@ MONGODB_URI = os.getenv(
 )
 DB_NAME = os.getenv("DB_NAME", "4dx_dashboard")
 EMBEDDING_DIMS = 128
+HF_EMBEDDING_MODEL = os.getenv("HF_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 SEED_VERSION = "milestone_leadmeasure_vector_v2"
 HEALTH_STATES = {"green", "amber", "red", "blocker", "approval", "hold"}
+_hf_model: Any = None
+_hf_model_error: str | None = None
 
 app = FastAPI(title="4DX Government Execution API")
 app.add_middleware(
@@ -158,6 +165,11 @@ class DecisionIn(BaseModel):
     requested_by: str
     due_date: str
     summary: str
+
+
+class AIDecisionIn(BaseModel):
+    project_id: str
+    question: str | None = None
 
 
 class DocumentIn(BaseModel):
@@ -317,7 +329,7 @@ def refresh_project_sla_notifications(project: dict[str, Any]) -> None:
                     db.notifications.update_one({"project_id": project["_id"], "title": "Lead measure due soon", "message": f"{measure.get('title')} is due in {remaining} days."}, {"$set": {"metadata": {"key": key}}})
 
 
-def text_embedding(text: str, dims: int = EMBEDDING_DIMS) -> list[float]:
+def deterministic_embedding(text: str, dims: int = EMBEDDING_DIMS) -> list[float]:
     tokens = re.findall(r"[a-z0-9]+", text.lower())
     vector = [0.0] * dims
     for token in tokens:
@@ -328,6 +340,64 @@ def text_embedding(text: str, dims: int = EMBEDDING_DIMS) -> list[float]:
         vector[idx] += sign * weight
     norm = math.sqrt(sum(v * v for v in vector)) or 1.0
     return [round(v / norm, 6) for v in vector]
+
+
+def projection_embedding(values: list[float], dims: int = EMBEDDING_DIMS) -> list[float]:
+    if not values:
+        return [0.0] * dims
+    if len(values) == dims:
+        vector = values
+    else:
+        vector = [0.0] * dims
+        for index, value in enumerate(values):
+            vector[index % dims] += float(value)
+    norm = math.sqrt(sum(v * v for v in vector)) or 1.0
+    return [round(v / norm, 6) for v in vector]
+
+
+def get_hf_embedding_model() -> Any:
+    global _hf_model, _hf_model_error
+    if _hf_model is not None:
+        return _hf_model
+    if _hf_model_error:
+        return None
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        _hf_model = SentenceTransformer(HF_EMBEDDING_MODEL)
+        return _hf_model
+    except Exception as exc:
+        _hf_model_error = str(exc)
+        return None
+
+
+def embedding_provider_status() -> dict[str, Any]:
+    model = get_hf_embedding_model()
+    if model is not None:
+        return {
+            "provider": "hugging_face",
+            "model": HF_EMBEDDING_MODEL,
+            "dimensions": EMBEDDING_DIMS,
+            "native_dimensions": int(getattr(model, "get_sentence_embedding_dimension", lambda: 0)() or 0),
+            "projection": "modulo_pooling_to_existing_vector_index",
+        }
+    return {
+        "provider": "deterministic_fallback",
+        "model": "local_hash_embedding",
+        "dimensions": EMBEDDING_DIMS,
+        "detail": _hf_model_error,
+    }
+
+
+def text_embedding(text: str, dims: int = EMBEDDING_DIMS) -> list[float]:
+    model = get_hf_embedding_model()
+    if model is None:
+        return deterministic_embedding(text, dims)
+    try:
+        vector = model.encode(text or "", normalize_embeddings=True)
+        return projection_embedding([float(value) for value in vector], dims)
+    except Exception:
+        return deterministic_embedding(text, dims)
 
 
 def cosine(a: list[float], b: list[float]) -> float:
@@ -847,6 +917,47 @@ def summarize_document(content: str, risk: dict[str, Any], measure: dict[str, An
     }
 
 
+def extract_pdf_text(raw: bytes) -> str:
+    try:
+        with fitz.open(stream=raw, filetype="pdf") as pdf:
+            pages = []
+            for page in pdf:
+                text = page.get_text("text").strip()
+                if text:
+                    pages.append(text)
+                if sum(len(item) for item in pages) > 30000:
+                    break
+            return "\n\n".join(pages).strip()
+    except Exception:
+        return ""
+
+
+def extract_uploaded_file_text(raw: bytes, filename: str, content_type: str | None) -> tuple[str, dict[str, Any]]:
+    lower_name = filename.lower()
+    mime = (content_type or "").lower()
+    meta = {
+        "file_name": filename,
+        "content_type": content_type or "application/octet-stream",
+        "file_size": len(raw),
+        "extraction_status": "extracted",
+    }
+    if mime == "application/pdf" or lower_name.endswith(".pdf") or raw.startswith(b"%PDF"):
+        text = extract_pdf_text(raw)
+        meta["file_kind"] = "pdf"
+        if text:
+            return text, meta
+        meta["extraction_status"] = "no_selectable_text"
+        return f"Uploaded PDF {filename}. Text extraction did not find selectable text. Review the attached PDF evidence for details.", meta
+    if mime.startswith("text/") or lower_name.endswith((".txt", ".csv", ".md", ".log")):
+        text = raw.decode("utf-8", errors="replace").strip()
+        meta["file_kind"] = "text"
+        if text:
+            return text, meta
+    meta["file_kind"] = "binary"
+    meta["extraction_status"] = "unsupported_binary"
+    return f"Uploaded file {filename}. This file type is stored as evidence, but readable text extraction is not available.", meta
+
+
 def insert_document(
     project_id: ObjectId,
     ministry_id: ObjectId,
@@ -856,6 +967,7 @@ def insert_document(
     uploaded_by: str,
     wig_id: str | None = None,
     measure_id: str | None = None,
+    file_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     project = db.projects.find_one({"_id": project_id})
     wig, measure = validate_document_target(project, wig_id, measure_id) if project else (None, None)
@@ -877,6 +989,7 @@ def insert_document(
         "risk_score": risk["score"],
         "ai_summary": summary,
         "uploaded_by": uploaded_by,
+        "file_meta": file_meta or None,
         "created_at": datetime.utcnow(),
     }
     result = db.documents.insert_one(doc)
@@ -1047,6 +1160,7 @@ def vector_readiness() -> dict[str, Any]:
     return {
         "native_ready": probe.get("mode") == "mongodb_vector_search",
         "mode": probe.get("mode"),
+        "embedding_provider": embedding_provider_status(),
         "entity_vectors": db.vectors.count_documents({}),
         "document_vectors": db.documents.count_documents({"embedding": {"$exists": True}}),
         "entity_index": {
@@ -1163,6 +1277,185 @@ def vector_search_documents(query: str, limit: int = 8, project_id: str | None =
             cleaned["score"] = round(score, 4)
             results.append(cleaned)
         return {"mode": "local_vector_fallback", "detail": str(exc), "results": results}
+
+
+def compact_project_for_ai(project: dict[str, Any]) -> dict[str, Any]:
+    wigs = []
+    for wig in project.get("wigs", []):
+        measures = []
+        for measure in wig.get("lead_measures", []):
+            comments = measure.get("comments", [])[-3:]
+            measures.append({
+                "title": measure.get("title"),
+                "current": measure.get("current_state") or measure.get("current_value") or measure.get("from_value"),
+                "target": measure.get("target_state") or measure.get("to_value"),
+                "deadline": measure.get("deadline"),
+                "assigned_to": measure.get("assigned_to", []),
+                "latest_states": [comment.get("health_state") for comment in comments],
+                "latest_comments": [comment.get("comment") for comment in comments],
+            })
+        wigs.append({
+            "title": wig.get("title"),
+            "current": wig.get("current_state") or wig.get("from_value"),
+            "target": wig.get("target_state") or wig.get("to_value"),
+            "deadline": wig.get("deadline"),
+            "owner": wig.get("owner"),
+            "lead_measures": measures,
+        })
+    return {
+        "name": project.get("name"),
+        "ministry": project.get("ministry"),
+        "owner": project.get("owner"),
+        "status": project.get("status"),
+        "health_score": project.get("health_score"),
+        "evidence_risk_score": project.get("evidence_risk_score"),
+        "current_state": project.get("current_state"),
+        "target_state": project.get("target_state"),
+        "deadline": project.get("due_date"),
+        "bottlenecks": project.get("bottlenecks", []),
+        "recommendations": project.get("recommendations", []),
+        "wigs": wigs,
+    }
+
+
+def collect_decision_context(project: dict[str, Any], question: str | None = None) -> dict[str, Any]:
+    docs = [clean_id(doc) for doc in db.documents.find({"project_id": project["_id"]}).sort("created_at", -1).limit(8)]
+    approvals = [clean_id(doc) for doc in db.approvals.find({"project_id": project["_id"]}).sort("created_at", -1).limit(6)]
+    assignments = [clean_id(doc) for doc in db.assignments.find({"project_id": project["_id"], "status": {"$ne": "Done"}}).sort("due_date", 1).limit(6)]
+    notifications = [clean_id(doc) for doc in db.notifications.find({"project_id": project["_id"], "status": "Open"}).sort("created_at", -1).limit(6)]
+    decisions = [clean_id(doc) for doc in db.decisions.find({"project_id": project["_id"]}).sort("created_at", -1).limit(6)]
+    query = question or f"{project.get('name')} blocker approval delay risk intervention decision"
+    entity_matches = semantic_search_entities(query, limit=8).get("results", [])
+    document_matches = vector_search_documents(query, limit=6, project_id=str(project["_id"])).get("results", [])
+    return {
+        "project": compact_project_for_ai(project),
+        "evidence": [{
+            "title": doc.get("title"),
+            "type": doc.get("document_type"),
+            "risk_score": doc.get("risk_score"),
+            "summary": doc.get("ai_summary", {}).get("headline") or doc.get("content", "")[:360],
+            "signals": [signal.get("name") for signal in doc.get("risk_signals", [])],
+            "lead_measure": doc.get("measure_title"),
+        } for doc in docs],
+        "approvals": approvals,
+        "assignments": assignments,
+        "notifications": notifications,
+        "decisions": decisions,
+        "vector_matches": [{
+            "type": item.get("entity_type") or item.get("document_type"),
+            "title": item.get("title"),
+            "state": item.get("state"),
+            "score": item.get("score"),
+            "text": item.get("text") or item.get("content", "")[:280],
+        } for item in (entity_matches[:5] + document_matches[:5])],
+    }
+
+
+def local_decision_brief(context: dict[str, Any]) -> dict[str, Any]:
+    project = context["project"]
+    risks = context.get("notifications", []) + context.get("approvals", [])
+    evidence = context.get("evidence", [])
+    blockers = project.get("bottlenecks", [])[:3]
+    next_action = "Run a 48-hour unblock review with the WIG owner, finance/approval owner, and project director."
+    if blockers:
+        next_action = f"Resolve {blockers[0]} first; assign one named owner and review progress in the next WIG cadence."
+    return {
+        "mode": "local_decision_engine",
+        "executive_position": f"{project.get('name')} needs targeted intervention because health is {project.get('health_score')}% and status is {project.get('status')}.",
+        "recommended_decision": "Intervene" if project.get("status") != "On Track" else "Monitor",
+        "decision_type": "Intervention" if project.get("status") != "On Track" else "Cadence",
+        "confidence": 0.72,
+        "why_now": [
+            f"Current bottlenecks: {', '.join(blockers) or 'No major bottleneck recorded'}.",
+            f"{len(evidence)} recent evidence documents are mapped to execution health.",
+            f"{len(risks)} open approvals, alerts, or escalations are active.",
+        ],
+        "risk_register": [
+            {"risk": item, "severity": "High" if project.get("status") == "Off Track" else "Medium", "mitigation": "Assign named owner and deadline."}
+            for item in (blockers or ["Cadence slippage"])
+        ],
+        "actions": [
+            {"owner": project.get("owner") or "Project Director", "action": next_action, "deadline": "Next 48 hours"},
+            {"owner": "PMU Lead", "action": "Update evidence-backed scoreboard after intervention review.", "deadline": "Next weekly meeting"},
+        ],
+        "questions_for_cm": [
+            "Which owner is accountable for closing the top blocker?",
+            "Is an approval or budget decision required this week?",
+            "What outcome will change by the next cadence review?",
+        ],
+        "source_evidence": [doc.get("title") for doc in evidence[:4]],
+    }
+
+
+def normalize_decision_brief(brief: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(brief or {})
+    confidence = normalized.get("confidence", 0.0)
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence > 1:
+        confidence = confidence / 100
+    normalized["confidence"] = max(0.0, min(confidence, 1.0))
+    for key in ("why_now", "risk_register", "actions", "questions_for_cm", "source_evidence"):
+        value = normalized.get(key)
+        if value is None:
+            normalized[key] = []
+        elif not isinstance(value, list):
+            normalized[key] = [value]
+    normalized.setdefault("recommended_decision", "Review")
+    normalized.setdefault("decision_type", "Intervention")
+    normalized.setdefault("executive_position", "AI brief generated from project execution data.")
+    return normalized
+
+
+def openai_decision_brief(context: dict[str, Any], question: str | None = None) -> dict[str, Any]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        brief = local_decision_brief(context)
+        brief["llm_status"] = "OPENAI_API_KEY not configured; used local decision engine."
+        return normalize_decision_brief(brief)
+    system = (
+        "You are a senior government 4DX execution advisor. "
+        "Turn project health, WIGs, lead measures, evidence, approvals, alerts, and vector matches into a concise executive decision brief. "
+        "Be specific, decision-oriented, and avoid generic project-management advice. Return only valid JSON."
+    )
+    schema_hint = {
+        "executive_position": "one sentence",
+        "recommended_decision": "Intervene | Monitor | Approve | Defer | Escalate",
+        "decision_type": "Intervention | Approval | Funding | Policy | Cadence",
+        "confidence": 0.0,
+        "why_now": ["3 concise evidence-backed reasons"],
+        "risk_register": [{"risk": "risk", "severity": "Low|Medium|High|Critical", "mitigation": "specific mitigation"}],
+        "actions": [{"owner": "role or person", "action": "specific action", "deadline": "date or timeframe"}],
+        "questions_for_cm": ["3 questions"],
+        "source_evidence": ["document or signal names"],
+    }
+    prompt = {
+        "question": question or "What decision should leadership take now?",
+        "required_json_shape": schema_hint,
+        "context": context,
+    }
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(prompt, default=str)[:24000]},
+            ],
+        )
+        content = response.choices[0].message.content or "{}"
+        data = json.loads(content)
+        data["mode"] = "openai_llm"
+        data["model"] = OPENAI_MODEL
+        return normalize_decision_brief(data)
+    except Exception as exc:
+        brief = local_decision_brief(context)
+        brief["llm_status"] = f"OpenAI generation failed; used local decision engine. {exc}"
+        return normalize_decision_brief(brief)
 
 
 @app.get("/api/health")
@@ -1649,10 +1942,9 @@ async def upload_document(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     raw = await file.read()
-    content = raw.decode("utf-8", errors="ignore")
-    if not content.strip():
-        content = f"Uploaded binary file {file.filename}. Text extraction is pending."
-    doc = insert_document(project["_id"], project["ministry_id"], file.filename or "Uploaded Document", document_type, content[:20000], user["phone"], wig_id, measure_id)
+    filename = file.filename or "Uploaded Document"
+    content, file_meta = extract_uploaded_file_text(raw, filename, file.content_type)
+    doc = insert_document(project["_id"], project["ministry_id"], filename, document_type, content[:20000], user["phone"], wig_id, measure_id, file_meta)
     refreshed = refresh_project_health(project["_id"])
     return {"document": clean_id(doc), "project": clean_id(refreshed)}
 
@@ -1728,6 +2020,37 @@ def update_assignment_status(assignment_id: str, status: str, user: dict[str, An
 @app.get("/api/decisions")
 def list_decisions(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
     return [clean_id(doc) for doc in db.decisions.find().sort("due_date", 1)]
+
+
+@app.post("/api/ai/decision-brief")
+def create_ai_decision_brief(payload: AIDecisionIn, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    project = db.projects.find_one({"_id": oid(payload.project_id)})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    project = refresh_project_health(project["_id"])
+    context = collect_decision_context(project, payload.question)
+    brief = openai_decision_brief(context, payload.question)
+    now = datetime.utcnow()
+    record = {
+        "project_id": project["_id"],
+        "ministry_id": project["ministry_id"],
+        "question": payload.question or "What decision should leadership take now?",
+        "brief": brief,
+        "context_snapshot": context,
+        "embedding_provider": embedding_provider_status(),
+        "created_by": user["phone"],
+        "created_at": now,
+    }
+    result = db.ai_decision_briefs.insert_one(record)
+    return {
+        "brief_id": str(result.inserted_id),
+        "generated_at": now.isoformat(),
+        "brief": brief,
+        "project": clean_id(project),
+        "evidence_count": len(context.get("evidence", [])),
+        "vector_match_count": len(context.get("vector_matches", [])),
+        "embedding_provider": record["embedding_provider"],
+    }
 
 
 @app.post("/api/decisions")

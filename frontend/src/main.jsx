@@ -2109,19 +2109,52 @@ function SearchProjectCard({ item }) {
 }
 
 function DocumentCard({ doc }) {
+  const summary = readableDocumentText(doc);
   return (
     <article className="doc-card">
       <h4>{doc.title}</h4>
       <p>{doc.document_type || doc.entity_type} | {doc.measure_title || doc.wig_title || (doc.state ? `state ${doc.state}` : `risk ${doc.risk_score || 0}`)}</p>
-      <span>{doc.ai_summary?.headline || doc.content || doc.text}</span>
+      <span>{summary}</span>
       <div>{(doc.risk_signals || []).map(s => <b key={s.name}>{s.name}</b>)}</div>
     </article>
   );
 }
 
+function looksLikeRawPdf(text = '') {
+  const sample = String(text).slice(0, 1200);
+  return sample.startsWith('%PDF') || (sample.includes('/Type /') && sample.includes('endobj')) || sample.includes('/FlateDecode');
+}
+
+function readableDocumentText(doc) {
+  const headline = doc.ai_summary?.headline;
+  const content = doc.content || doc.text || '';
+  if (looksLikeRawPdf(headline) || looksLikeRawPdf(content)) {
+    return 'PDF evidence uploaded. The document is stored for evidence review; readable text extraction will be used for summaries on new uploads.';
+  }
+  return headline || content || 'No readable summary available.';
+}
+
+function daysFromNow(days) {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function riskLine(item) {
+  if (typeof item === 'string') return item;
+  return `${item.severity || 'Risk'} ${item.risk || item.title || 'Execution risk'} - ${item.mitigation || 'Assign mitigation owner.'}`;
+}
+
+function actionLine(item) {
+  if (typeof item === 'string') return item;
+  return `${item.owner || 'Owner'}: ${item.action || item.title || 'Take action'} ${item.deadline ? `(${item.deadline})` : ''}`;
+}
+
 function EvidenceSummaryCard({ doc }) {
   const summary = doc.ai_summary || {};
   const signals = summary.risk_signals?.length ? summary.risk_signals : (doc.risk_signals || []).map(signal => signal.name);
+  const displayText = readableDocumentText(doc);
+  const highlights = (summary.highlights || []).filter(item => !looksLikeRawPdf(item));
   return (
     <article className="evidence-summary-card">
       <div className="evidence-summary-head">
@@ -2131,10 +2164,10 @@ function EvidenceSummaryCard({ doc }) {
           <small>{doc.document_type} | risk {summary.risk_score ?? doc.risk_score ?? 0}</small>
         </span>
       </div>
-      <p>{summary.headline || doc.content || 'No summary available.'}</p>
-      {summary.highlights?.length > 1 && (
+      <p>{displayText}</p>
+      {highlights.length > 1 && (
         <ul>
-          {summary.highlights.slice(1, 3).map(item => <li key={item}>{item}</li>)}
+          {highlights.slice(1, 3).map(item => <li key={item}>{item}</li>)}
         </ul>
       )}
       <div className="evidence-summary-meta">
@@ -2150,10 +2183,18 @@ function Decisions({ overview, api, reload }) {
   const decisions = overview?.decisions || [];
   const [form, setForm] = useState({ project_id: projects[0]?._id || '', title: '', decision_type: 'Intervention', requested_by: '', due_date: '', summary: '' });
   const [open, setOpen] = useState(false);
+  const [aiProjectId, setAiProjectId] = useState(projects[0]?._id || '');
+  const [aiQuestion, setAiQuestion] = useState('What decision should leadership take now?');
+  const [aiResult, setAiResult] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState('');
 
   useEffect(() => {
     if (!projects.some(project => project._id === form.project_id)) {
       setForm(prev => ({ ...prev, project_id: projects[0]?._id || '' }));
+    }
+    if (!projects.some(project => project._id === aiProjectId)) {
+      setAiProjectId(projects[0]?._id || '');
     }
   }, [projects]);
 
@@ -2170,11 +2211,108 @@ function Decisions({ overview, api, reload }) {
     reload();
   }
 
+  async function generateAIBrief(e) {
+    e.preventDefault();
+    if (!aiProjectId) return;
+    setAiLoading(true);
+    setAiError('');
+    try {
+      const result = await api('/api/ai/decision-brief', {
+        method: 'POST',
+        body: JSON.stringify({ project_id: aiProjectId, question: aiQuestion })
+      });
+      setAiResult(result);
+    } catch (err) {
+      setAiError(err.message || 'AI decision generation failed');
+    } finally {
+      setAiLoading(false);
+    }
+  }
+
+  async function addAIBriefToQueue() {
+    if (!aiResult?.brief || !aiProjectId) return;
+    const brief = aiResult.brief;
+    const project = projects.find(item => item._id === aiProjectId);
+    const summary = [
+      brief.executive_position,
+      ...(brief.why_now || []).map(item => `Why now: ${item}`),
+      ...(brief.actions || []).map(item => `Action: ${actionLine(item)}`)
+    ].filter(Boolean).join('\n');
+    await api('/api/decisions', {
+      method: 'POST',
+      body: JSON.stringify({
+        project_id: aiProjectId,
+        title: `${brief.recommended_decision || 'AI Recommendation'}: ${project?.name || 'Project'}`,
+        decision_type: brief.decision_type || 'Intervention',
+        requested_by: 'AI Decision Engine',
+        due_date: daysFromNow(7),
+        summary
+      })
+    });
+    reload();
+  }
+
   return (
     <section className="tesla-stage">
       <div className="stage-toolbar">
         <div><h3>Decisions</h3><span>{decisions.length} pending items</span></div>
         <button className="primary-btn" disabled={!projects.length} onClick={() => setOpen(true)}>Create Decision</button>
+      </div>
+      <div className="ai-decision-panel">
+        <div className="ai-decision-copy">
+          <span><Brain size={17} /> AI Decision Engine</span>
+          <h3>Evidence-backed 4DX recommendation</h3>
+          <p>Uses project health, WIGs, lead measures, evidence documents, MongoDB vector matches, approvals and alerts to draft a leadership decision.</p>
+        </div>
+        <form className="ai-decision-controls" onSubmit={generateAIBrief}>
+          <select value={aiProjectId} onChange={e => setAiProjectId(e.target.value)} required>
+            {projects.map(project => <option key={project._id} value={project._id}>{project.name}</option>)}
+          </select>
+          <input value={aiQuestion} onChange={e => setAiQuestion(e.target.value)} placeholder="Ask a leadership decision question" />
+          <button className="primary-btn" disabled={aiLoading || !projects.length}>{aiLoading ? 'Analyzing...' : 'Generate Brief'}</button>
+        </form>
+        {aiError && <p className="ai-error">{aiError}</p>}
+        {aiResult?.brief && (
+          <div className="ai-brief-card">
+            <div className="ai-brief-head">
+              <div>
+                <small>Recommended decision</small>
+                <h3>{aiResult.brief.recommended_decision || 'Review'}</h3>
+                <p>{aiResult.brief.executive_position}</p>
+              </div>
+              <div>
+                <small>Confidence</small>
+                <strong>{Math.round((aiResult.brief.confidence || 0) * 100)}%</strong>
+                <span>{aiResult.brief.mode === 'openai_llm' ? aiResult.brief.model : 'Local fallback'}</span>
+              </div>
+            </div>
+            <div className="ai-brief-grid">
+              <div>
+                <h4>Why now</h4>
+                {(aiResult.brief.why_now || []).slice(0, 4).map(item => <p key={item}>{item}</p>)}
+              </div>
+              <div>
+                <h4>Risks</h4>
+                {(aiResult.brief.risk_register || []).slice(0, 4).map((item, index) => <p key={`${riskLine(item)}-${index}`}>{riskLine(item)}</p>)}
+              </div>
+              <div>
+                <h4>Actions</h4>
+                {(aiResult.brief.actions || []).slice(0, 4).map((item, index) => <p key={`${actionLine(item)}-${index}`}>{actionLine(item)}</p>)}
+              </div>
+              <div>
+                <h4>CM questions</h4>
+                {(aiResult.brief.questions_for_cm || []).slice(0, 4).map(item => <p key={item}>{item}</p>)}
+              </div>
+            </div>
+            <div className="ai-status-strip">
+              <span>{aiResult.evidence_count} evidence docs</span>
+              <span>{aiResult.vector_match_count} vector matches</span>
+              <span>{aiResult.embedding_provider?.provider || 'embedding'} | {aiResult.embedding_provider?.model || 'model pending'}</span>
+              <button className="ghost-btn" type="button" onClick={addAIBriefToQueue}>Add to Decision Queue</button>
+            </div>
+            {aiResult.brief.llm_status && <p className="ai-note">{aiResult.brief.llm_status}</p>}
+          </div>
+        )}
       </div>
       <div className="card glass-panel">
         <h3><Gavel size={22} /> Decision Queue</h3>
@@ -2314,6 +2452,7 @@ function Admin({ settings, setSettings, api, reload }) {
           <span>Vector Search Readiness</span>
           <p>{vectorReadiness?.native_ready ? 'MongoDB Atlas native search active' : 'Local vector fallback active'}</p>
           <small>{vectorReadiness?.entity_vectors || 0} workflow vectors | {vectorReadiness?.document_vectors || 0} document vectors</small>
+          <small>{vectorReadiness?.embedding_provider?.provider || 'embedding'} | {vectorReadiness?.embedding_provider?.model || 'model not loaded'}</small>
           <small>Entity index {vectorReadiness?.entity_index?.present ? 'ready' : 'not visible'} | Document index {vectorReadiness?.document_index?.present ? 'ready' : 'not visible'}</small>
         </div>
         {saved && <p className="saved">Saved</p>}
