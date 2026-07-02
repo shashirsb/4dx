@@ -75,6 +75,16 @@ function App() {
     }
   }, [session]);
 
+  const projects = overview?.projects || [];
+  const ministries = overview?.ministries || [];
+  const [filters, setFilters] = useState({ ministryId: '', projectId: '', wigId: '', health: '' });
+  const filteredProjects = useMemo(() => filterProjects(projects, filters), [projects, filters]);
+  const filteredOverview = useMemo(() => buildFilteredOverview(overview, filteredProjects), [overview, filteredProjects]);
+  const filteredMinistries = useMemo(() => {
+    if (!filters.ministryId) return ministries;
+    return ministries.filter(ministry => ministry._id === filters.ministryId);
+  }, [ministries, filters.ministryId]);
+
   async function api(path, options = {}) {
     const headers = { ...(options.headers || {}) };
     if (session?.token) headers.Authorization = `Bearer ${session.token}`;
@@ -102,21 +112,19 @@ function App() {
     return <Login settings={settings} onSession={setSession} />;
   }
 
-  const projects = overview?.projects || [];
-  const ministries = overview?.ministries || [];
-
   return (
     <div className="app-shell">
       <Sidebar active={active} setActive={setActive} settings={settings} session={session} onLogout={() => setSession(null)} />
       <main className="workspace">
         <TopBar settings={settings} session={session} refresh={() => loadOverview()} loading={loading} />
-        {active === 'overview' && <Overview overview={overview} loading={loading} />}
-        {active === 'ministries' && <Ministries ministries={ministries} projects={projects} />}
-        {active === 'projects' && <Projects projects={projects} ministries={ministries} api={api} reload={loadOverview} />}
-        {active === 'workflow' && <Workflow overview={overview} api={api} reload={loadOverview} />}
-        {active === 'evidence' && <Evidence projects={projects} api={api} reload={loadOverview} />}
-        {active === 'decisions' && <Decisions overview={overview} api={api} reload={loadOverview} />}
-        {active === 'disciplines' && <Disciplines overview={overview} />}
+        <GlobalFilters projects={projects} ministries={ministries} filters={filters} setFilters={setFilters} resultCount={filteredProjects.length} />
+        {active === 'overview' && <Overview overview={filteredOverview} loading={loading} />}
+        {active === 'ministries' && <Ministries ministries={filteredMinistries} projects={filteredProjects} />}
+        {active === 'projects' && <Projects projects={filteredProjects} allProjects={projects} ministries={ministries} api={api} reload={loadOverview} />}
+        {active === 'workflow' && <Workflow overview={filteredOverview} api={api} reload={loadOverview} />}
+        {active === 'evidence' && <Evidence projects={filteredProjects} api={api} reload={loadOverview} />}
+        {active === 'decisions' && <Decisions overview={filteredOverview} api={api} reload={loadOverview} />}
+        {active === 'disciplines' && <Disciplines overview={filteredOverview} />}
         {active === 'admin' && session.user.role === 'admin' && <Admin settings={settings} setSettings={setSettings} api={api} reload={loadOverview} />}
       </main>
     </div>
@@ -230,18 +238,94 @@ function Sidebar({ active, setActive, settings, session, onLogout }) {
   );
 }
 
+function GlobalFilters({ projects, ministries, filters, setFilters, resultCount }) {
+  const ministryProjects = useMemo(() => {
+    if (!filters.ministryId) return projects;
+    return projects.filter(project => project.ministry_id === filters.ministryId);
+  }, [projects, filters.ministryId]);
+  const wigOptions = useMemo(() => {
+    const scoped = filters.projectId ? projects.filter(project => project._id === filters.projectId) : ministryProjects;
+    return scoped.flatMap(project => (project.wigs || [])
+      .filter(wig => !wig.archived_at)
+      .map(wig => ({ id: wig.id, title: wig.title, project: project.name })));
+  }, [projects, ministryProjects, filters.projectId]);
+  const hasFilters = filters.ministryId || filters.projectId || filters.wigId || filters.health;
+
+  function updateFilter(key, value) {
+    setFilters(prev => {
+      const next = { ...prev, [key]: value };
+      if (key === 'ministryId') {
+        next.projectId = '';
+        next.wigId = '';
+      }
+      if (key === 'projectId') {
+        next.wigId = '';
+      }
+      return next;
+    });
+  }
+
+  return (
+    <section className="global-filter-bar" aria-label="Portfolio filters">
+      <label>
+        <span>Ministry</span>
+        <select value={filters.ministryId} onChange={e => updateFilter('ministryId', e.target.value)}>
+          <option value="">All ministries</option>
+          {ministries.map(ministry => <option key={ministry._id} value={ministry._id}>{ministry.name}</option>)}
+        </select>
+      </label>
+      <label>
+        <span>Project</span>
+        <select value={filters.projectId} onChange={e => updateFilter('projectId', e.target.value)}>
+          <option value="">All projects</option>
+          {ministryProjects.map(project => <option key={project._id} value={project._id}>{project.name}</option>)}
+        </select>
+      </label>
+      <label>
+        <span>WIG / Milestone</span>
+        <select value={filters.wigId} onChange={e => updateFilter('wigId', e.target.value)}>
+          <option value="">All WIGs</option>
+          {wigOptions.map(wig => <option key={`${wig.project}-${wig.id}`} value={wig.id}>{wig.title}</option>)}
+        </select>
+      </label>
+      <label>
+        <span>Health</span>
+        <select value={filters.health} onChange={e => updateFilter('health', e.target.value)}>
+          <option value="">Any health</option>
+          <option value="On Track">On Track</option>
+          <option value="At Risk">At Risk</option>
+          <option value="Off Track">Off Track</option>
+          <option value="green">Green</option>
+          <option value="amber">Amber</option>
+          <option value="red">Red</option>
+          <option value="blocker">Blocker</option>
+          <option value="approval">Approval</option>
+          <option value="hold">Hold</option>
+        </select>
+      </label>
+      <div className="filter-result-pill">
+        <FileSearch size={15} />
+        <span>{resultCount} projects</span>
+      </div>
+      {hasFilters && <button className="ghost-btn" onClick={() => setFilters({ ministryId: '', projectId: '', wigId: '', health: '' })}>Clear</button>}
+    </section>
+  );
+}
+
 function TopBar({ settings, session, refresh, loading }) {
   return (
     <header className="app-header">
-      <img className="app-header-banner" src="/karnataka-ai-header-2026.png" alt="AI in Government of Karnataka" />
-      <div className="topbar">
-        <button className="icon-btn"><Menu size={20} /></button>
-        <div>
-          <h2>{settings?.title || 'Execution Command Center'}</h2>
-          <p>{settings?.banner || 'High level view. Right insights. Timely interventions.'}</p>
+      <div className="app-header-banner" aria-label="AI in Government of Karnataka">
+        <img className="app-header-left" src="/karnataka-header-left.png" alt="Government of Karnataka AI initiative" />
+        <span aria-hidden="true" />
+        <div className="app-header-right-stack">
+          <div className="topbar">
+            <button className="icon-btn"><Menu size={20} /></button>
+            <button className="refresh-btn" onClick={refresh}><RefreshCw size={17} className={loading ? 'spin' : ''} /> Refresh</button>
+            <div className="user-pill"><UserRound size={18} /> {session.user.phone}</div>
+          </div>
+          <img className="app-header-right" src="/karnataka-header-right.png" alt="Smarter decisions and governance outcomes" />
         </div>
-        <button className="refresh-btn" onClick={refresh}><RefreshCw size={17} className={loading ? 'spin' : ''} /> Refresh</button>
-        <div className="user-pill"><UserRound size={18} /> {session.user.phone}</div>
       </div>
     </header>
   );
@@ -373,7 +457,7 @@ function Ministries({ ministries, projects }) {
   );
 }
 
-function Projects({ projects, ministries, api, reload }) {
+function Projects({ projects, allProjects = projects, ministries, api, reload }) {
   const [wizardOpen, setWizardOpen] = useState(false);
   const [detailProject, setDetailProject] = useState(null);
   const [query, setQuery] = useState('');
@@ -397,7 +481,7 @@ function Projects({ projects, ministries, api, reload }) {
       <div className="stage-toolbar">
         <div>
           <h3>Projects</h3>
-          <span>{filteredProjects.length} of {projects.length} active missions</span>
+          <span>{filteredProjects.length} of {allProjects.length} active missions</span>
         </div>
         <div className="stage-actions">
           <label className="project-search">
@@ -1635,6 +1719,64 @@ function countMeasures(project) {
   return (project.wigs || []).reduce((sum, wig) => sum + (wig.lead_measures?.length || 0), 0);
 }
 
+function filterProjects(projects, filters = {}) {
+  return projects.filter(project => {
+    if (filters.ministryId && project.ministry_id !== filters.ministryId) return false;
+    if (filters.projectId && project._id !== filters.projectId) return false;
+    if (filters.wigId && !(project.wigs || []).some(wig => !wig.archived_at && wig.id === filters.wigId)) return false;
+    if (filters.health && !projectMatchesHealth(project, filters.health)) return false;
+    return true;
+  });
+}
+
+function projectMatchesHealth(project, health) {
+  const target = normalizeHealth(health);
+  if (!target) return true;
+  const statuses = new Set();
+  statuses.add(normalizeHealth(project.status));
+  (project.milestones || []).forEach(item => statuses.add(normalizeHealth(item.status)));
+  (project.wigs || []).forEach(wig => {
+    statuses.add(normalizeHealth(wig.status));
+    (wig.lead_measures || []).forEach(measure => {
+      statuses.add(normalizeHealth(measure.status));
+      (measure.comments || []).forEach(comment => statuses.add(normalizeHealth(comment.health_state)));
+    });
+  });
+  return statuses.has(target);
+}
+
+function normalizeHealth(value = '') {
+  return String(value || '').trim().toLowerCase().replace(/[_\s-]+/g, '-');
+}
+
+function buildFilteredOverview(overview, projects) {
+  if (!overview) return overview;
+  const projectIds = new Set(projects.map(project => project._id));
+  const stats = {
+    total: projects.length,
+    on_track: projects.filter(project => project.status === 'On Track').length,
+    at_risk: projects.filter(project => project.status === 'At Risk').length,
+    off_track: projects.filter(project => project.status === 'Off Track').length,
+    health_score: projects.length ? Math.round(projects.reduce((sum, project) => sum + (project.health_score || 0), 0) / projects.length) : 0
+  };
+  const bottleneckCounts = {};
+  projects.forEach(project => (project.bottlenecks || []).forEach(name => {
+    bottleneckCounts[name] = (bottleneckCounts[name] || 0) + 1;
+  }));
+  const bottlenecks = Object.entries(bottleneckCounts)
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+  return {
+    ...overview,
+    projects,
+    stats,
+    bottlenecks,
+    assignments: (overview.assignments || []).filter(item => projectIds.has(item.project_id)),
+    decisions: (overview.decisions || []).filter(item => projectIds.has(item.project_id))
+  };
+}
+
 function currentStateText(entity = {}, fallback = 'Current state not captured') {
   if (entity.current_state) return entity.current_state;
   if (entity.current_value !== undefined || entity.from_value !== undefined) {
@@ -1749,7 +1891,9 @@ function Workflow({ overview, api, reload }) {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
-    if (!form.project_id && projects[0]?._id) setForm(prev => ({ ...prev, project_id: projects[0]._id }));
+    if (!projects.some(project => project._id === form.project_id)) {
+      setForm(prev => ({ ...prev, project_id: projects[0]?._id || '' }));
+    }
   }, [projects]);
 
   async function addAssignment(e) {
@@ -1769,12 +1913,13 @@ function Workflow({ overview, api, reload }) {
     <section className="tesla-stage">
       <div className="stage-toolbar">
         <div><h3>Workflow</h3><span>{assignments.length} open actions</span></div>
-        <button className="primary-btn" onClick={() => setOpen(true)}>Assign Action</button>
+        <button className="primary-btn" disabled={!projects.length} onClick={() => setOpen(true)}>Assign Action</button>
       </div>
       <div className="card glass-panel">
         <h3><CalendarClock size={22} /> Assigned Actions</h3>
         <div className="action-list">
           {assignments.map(a => <ActionRow key={a._id} item={a} projects={projects} onDone={() => closeAssignment(a._id)} />)}
+          {assignments.length === 0 && <p className="empty-state">No workflow actions match the current filters.</p>}
         </div>
       </div>
       {open && <Modal title="Assign Workflow" onClose={() => setOpen(false)}>
@@ -1823,11 +1968,15 @@ function Evidence({ projects, api, reload }) {
   const [uploadOpen, setUploadOpen] = useState(false);
 
   useEffect(() => {
-    if (!projectId && projects[0]?._id) setProjectId(projects[0]._id);
+    if (!projects.some(project => project._id === projectId)) {
+      setProjectId(projects[0]?._id || '');
+      setBundle(null);
+    }
   }, [projects]);
 
   useEffect(() => {
     if (projectId) loadEvidence(projectId);
+    if (!projectId) setBundle(null);
   }, [projectId]);
 
   useEffect(() => {
@@ -1894,11 +2043,14 @@ function Evidence({ projects, api, reload }) {
     <section className="tesla-stage">
       <div className="stage-toolbar">
         <div><h3>Evidence AI</h3><span>Vector search across projects, WIGs, comments, and documents</span></div>
-        <button className="primary-btn" onClick={() => setUploadOpen(true)}>Upload Evidence</button>
+        <button className="primary-btn" disabled={!projects.length} onClick={() => setUploadOpen(true)}>Upload Evidence</button>
       </div>
       <div className="card evidence-main glass-panel">
         <h3><Brain size={22} /> Evidence Intelligence</h3>
-        <select value={projectId} onChange={e => setProjectId(e.target.value)}>{projects.map(p => <option key={p._id} value={p._id}>{p.name}</option>)}</select>
+        <select value={projectId} onChange={e => setProjectId(e.target.value)}>
+          {projects.length === 0 && <option value="">No projects match filters</option>}
+          {projects.map(p => <option key={p._id} value={p._id}>{p.name}</option>)}
+        </select>
         {project && (
           <div className="health-explain">
             <div><strong>{project.health_score}%</strong><span>{project.status}</span></div>
@@ -1919,7 +2071,7 @@ function Evidence({ projects, api, reload }) {
             {(results.results || []).map(r => <DocumentCard key={r._id} doc={r} />)}
           </div>
         )}
-        <div className="document-grid">{(bundle?.documents || []).map(d => <DocumentCard key={d._id} doc={d} />)}</div>
+        <div className="document-grid">{(bundle?.documents || []).map(d => <DocumentCard key={d._id} doc={d} />)}{!projectId && <p className="empty-state">No evidence matches the current filters.</p>}</div>
       </div>
       {uploadOpen && <Modal title="Upload Evidence" onClose={() => setUploadOpen(false)}>
       <form className="project-form" onSubmit={addDocument}>
@@ -2000,7 +2152,9 @@ function Decisions({ overview, api, reload }) {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
-    if (!form.project_id && projects[0]?._id) setForm(prev => ({ ...prev, project_id: projects[0]._id }));
+    if (!projects.some(project => project._id === form.project_id)) {
+      setForm(prev => ({ ...prev, project_id: projects[0]?._id || '' }));
+    }
   }, [projects]);
 
   async function addDecision(e) {
@@ -2020,12 +2174,13 @@ function Decisions({ overview, api, reload }) {
     <section className="tesla-stage">
       <div className="stage-toolbar">
         <div><h3>Decisions</h3><span>{decisions.length} pending items</span></div>
-        <button className="primary-btn" onClick={() => setOpen(true)}>Create Decision</button>
+        <button className="primary-btn" disabled={!projects.length} onClick={() => setOpen(true)}>Create Decision</button>
       </div>
       <div className="card glass-panel">
         <h3><Gavel size={22} /> Decision Queue</h3>
         <div className="action-list">
           {decisions.map(d => <DecisionRow key={d._id} item={d} projects={projects} onMark={status => mark(d._id, status)} />)}
+          {decisions.length === 0 && <p className="empty-state">No decisions match the current filters.</p>}
         </div>
       </div>
       {open && <Modal title="Create Decision" onClose={() => setOpen(false)}>
