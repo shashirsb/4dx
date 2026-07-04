@@ -1,0 +1,494 @@
+"""Bundled demo dataset builder and loader for dev-mode reseed."""
+
+from __future__ import annotations
+
+import json
+import os
+import uuid
+from datetime import date, datetime, timedelta
+from typing import Any
+
+from bson import ObjectId
+
+DEMO_VERSION = "demo_story_v1"
+
+DATA_COLLECTIONS = [
+    "ministries",
+    "projects",
+    "documents",
+    "vectors",
+    "assignments",
+    "decisions",
+    "approvals",
+    "notifications",
+    "weekly_meetings",
+    "health_snapshots",
+    "ai_insights",
+    "ai_decision_briefs",
+]
+
+ALLOWED_COLLECTIONS = {
+    "users",
+    "sessions",
+    "otp_requests",
+    *DATA_COLLECTIONS,
+    "settings",
+    "audit_events",
+}
+
+
+def _iso(dt: datetime | date) -> str:
+    if isinstance(dt, datetime):
+        return dt.isoformat()
+    return dt.isoformat()
+
+
+def _days_ago(n: int) -> datetime:
+    return datetime.utcnow() - timedelta(days=n)
+
+
+def build_demo_dataset() -> dict[str, Any]:
+    today = datetime.utcnow().date()
+    past = (today - timedelta(days=14)).isoformat()
+    soon = (today + timedelta(days=21)).isoformat()
+    project_due = (today + timedelta(days=120)).isoformat()
+    overdue = (today - timedelta(days=9)).isoformat()
+
+    multiline_comment = (
+        "Field verification summary:\n\n"
+        "- Ward 12 pipeline laying complete\n"
+        "- Ward 7 awaiting utility clearance\n"
+        "- Contractor mobilisation delayed 5 days\n\n"
+        "Next: escalate with municipal commissioner."
+    )
+
+    return {
+        "version": DEMO_VERSION,
+        "ministries": [
+            {"name": "Urban Development", "minister": "Minister Chen Wei", "mandate": "City infrastructure and smart services"},
+            {"name": "Water Resources", "minister": "Minister Ananya Rao", "mandate": "Drinking water and irrigation delivery"},
+            {"name": "Public Works", "minister": "Minister James Okonkwo", "mandate": "Roads, bridges, and transport corridors"},
+            {"name": "Health", "minister": "Minister Sofia Lindström", "mandate": "Hospital upgrades and emergency response"},
+        ],
+        "projects": [
+            {
+                "name": "Marina Bay Resilience Programme",
+                "ministry": "Urban Development",
+                "owner": "Ms. Priya Menon",
+                "current_state": "62% integrated command rollout; flood sensors live in 4 districts",
+                "target_state": "City-wide resilience command by Q4 with 95% sensor uptime",
+                "phase": "Rollout",
+                "wig": "Deploy integrated civic command centres",
+                "due_date": project_due,
+                "budget_crore": 420,
+                "spent_crore": 198,
+                "priority": 8,
+                "kpis": {"schedule": 72, "budget": 78, "quality": 81, "citizen_impact": 85, "cadence": 80, "lead_measures": 76, "document_confidence": 70, "compliance": 82},
+                "wigs": [
+                    {
+                        "id": "wig-mbr-1",
+                        "title": "Deploy integrated civic command centres",
+                        "current_state": "4 of 8 cities live",
+                        "target_state": "8 cities operational with unified dashboard",
+                        "from_value": 0, "to_value": 8, "unit": "cities", "current_value": 4,
+                        "deadline": soon, "owner": "Ms. Priya Menon",
+                        "update_frequency": "weekly", "budget_allocated": 240, "priority": 8,
+                        "lead_measures": [
+                            {
+                                "id": "lm-mbr-1",
+                                "title": "Commission sensor mesh in priority wards",
+                                "current_state": "312 sensors installed",
+                                "target_state": "600 sensors with live telemetry",
+                                "from_value": 0, "to_value": 600, "unit": "sensors", "current_value": 312,
+                                "deadline": soon, "assigned_to": ["IoT Lead", "District Engineer"],
+                                "budget_allocated": 95, "priority": 7, "status": "Open",
+                                "comments": [{"comment": multiline_comment, "health_state": "amber", "author": "IoT Lead", "created_at": _iso(_days_ago(2))}],
+                                "progress_history": [{"current_value": 312, "note": "Batch 4 deployed", "health_state": "amber", "author": "IoT Lead", "created_at": _iso(_days_ago(2))}],
+                            },
+                            {
+                                "id": "lm-mbr-2",
+                                "title": "Train ward operators on escalation protocol",
+                                "current_state": "18 operators certified",
+                                "target_state": "40 operators certified",
+                                "from_value": 0, "to_value": 40, "unit": "operators", "current_value": 18,
+                                "deadline": overdue, "assigned_to": ["Training PMU"],
+                                "budget_allocated": 35, "priority": 6, "status": "Open",
+                                "comments": [{"comment": "Training backlog in eastern cluster.\nSchedule makeup sessions next week.", "health_state": "red", "author": "PMU Coach", "created_at": _iso(_days_ago(16))}],
+                            },
+                        ],
+                    },
+                    {
+                        "id": "wig-mbr-2",
+                        "title": "Strengthen weekly cadence discipline",
+                        "current_state": "71% commitments closed",
+                        "target_state": "90% commitments closed each Friday",
+                        "from_value": 50, "to_value": 90, "unit": "% closed", "current_value": 71,
+                        "deadline": project_due, "owner": "4DX Coach Tan",
+                        "update_frequency": "bi-weekly", "budget_allocated": 80, "priority": 5,
+                        "lead_measures": [
+                            {
+                                "id": "lm-mbr-3",
+                                "title": "Publish scoreboard before WIG session",
+                                "from_value": 0, "to_value": 12, "unit": "sessions", "current_value": 7,
+                                "deadline": project_due, "assigned_to": ["PMU Analyst"],
+                                "budget_allocated": 20, "priority": 5, "status": "Open",
+                                "current_state": "7 sessions published", "target_state": "12 sessions on time",
+                            },
+                        ],
+                    },
+                ],
+            },
+            {
+                "name": "Northern Aqueduct Restoration",
+                "ministry": "Water Resources",
+                "owner": "Dr. Rahul Verma",
+                "current_state": "48% pipeline rehabilitation; 2 clearances pending",
+                "target_state": "24x7 supply to 1.2M residents by December",
+                "phase": "Clearances",
+                "wig": "Secure statutory approvals and complete Phase 1 pipeline",
+                "due_date": (today + timedelta(days=95)).isoformat(),
+                "budget_crore": 680,
+                "spent_crore": 410,
+                "priority": 9,
+                "kpis": {"schedule": 48, "budget": 62, "quality": 70, "citizen_impact": 74, "cadence": 55, "lead_measures": 42, "document_confidence": 58, "compliance": 51},
+                "wigs": [
+                    {
+                        "id": "wig-nar-1",
+                        "title": "Secure statutory approvals and complete Phase 1 pipeline",
+                        "from_value": 20, "to_value": 100, "unit": "% pipeline", "current_value": 48,
+                        "deadline": overdue, "owner": "Dr. Rahul Verma",
+                        "update_frequency": "daily", "budget_allocated": 400, "priority": 9,
+                        "current_state": "48% Phase 1 complete", "target_state": "100% Phase 1 commissioned",
+                        "lead_measures": [
+                            {
+                                "id": "lm-nar-1",
+                                "title": "Move clearance files from 2 to 9 authorities",
+                                "from_value": 2, "to_value": 9, "unit": "authorities", "current_value": 4,
+                                "deadline": overdue, "assigned_to": ["Officer A", "Officer B"],
+                                "budget_allocated": 120, "priority": 9, "status": "Open",
+                                "current_state": "4 authorities cleared", "target_state": "9 authorities cleared",
+                                "comments": [{"comment": "Forest clearance blocked.\nLegal review scheduled Thursday.", "health_state": "blocker", "author": "Officer A", "created_at": _iso(_days_ago(3))}],
+                            },
+                        ],
+                    },
+                ],
+            },
+            {
+                "name": "Trans-European Corridor Upgrade",
+                "ministry": "Public Works",
+                "owner": "Elena Müller",
+                "current_state": "71% earthworks complete on Package B",
+                "target_state": "420 km upgraded corridor open to traffic",
+                "phase": "Construction",
+                "wig": "Complete Package B earthworks and bridge deck",
+                "due_date": (today + timedelta(days=140)).isoformat(),
+                "budget_crore": 1240,
+                "spent_crore": 720,
+                "priority": 7,
+                "kpis": {"schedule": 71, "budget": 74, "quality": 79, "citizen_impact": 68, "cadence": 77, "lead_measures": 73, "document_confidence": 65, "compliance": 70},
+                "wigs": [
+                    {
+                        "id": "wig-tec-1",
+                        "title": "Complete Package B earthworks and bridge deck",
+                        "from_value": 55, "to_value": 100, "unit": "% complete", "current_value": 71,
+                        "deadline": (today + timedelta(days=60)).isoformat(), "owner": "Elena Müller",
+                        "update_frequency": "weekly", "budget_allocated": 720, "priority": 7,
+                        "current_state": "71% earthworks", "target_state": "100% Package B ready",
+                        "lead_measures": [
+                            {
+                                "id": "lm-tec-1",
+                                "title": "Weekly verified progress submissions",
+                                "from_value": 0, "to_value": 20, "unit": "reports", "current_value": 14,
+                                "deadline": (today + timedelta(days=45)).isoformat(),
+                                "assigned_to": ["Site Engineer", "QA Lead"],
+                                "budget_allocated": 45, "priority": 6, "status": "Open",
+                                "current_state": "14 reports filed", "target_state": "20 verified reports",
+                            },
+                        ],
+                    },
+                ],
+            },
+            {
+                "name": "Regional Hospital Modernisation",
+                "ministry": "Health",
+                "owner": "Dr. Sofia Lindström",
+                "current_state": "9 of 12 hospitals upgraded; ICU equipment installed",
+                "target_state": "12 hospitals with full ICU and diagnostics capacity",
+                "phase": "Procurement",
+                "wig": "Complete ICU commissioning across remaining sites",
+                "due_date": (today + timedelta(days=85)).isoformat(),
+                "budget_crore": 310,
+                "spent_crore": 245,
+                "priority": 6,
+                "kpis": {"schedule": 82, "budget": 88, "quality": 86, "citizen_impact": 90, "cadence": 84, "lead_measures": 80, "document_confidence": 72, "compliance": 85},
+                "wigs": [
+                    {
+                        "id": "wig-rhm-1",
+                        "title": "Complete ICU commissioning across remaining sites",
+                        "from_value": 6, "to_value": 12, "unit": "hospitals", "current_value": 9,
+                        "deadline": (today + timedelta(days=50)).isoformat(), "owner": "Dr. Sofia Lindström",
+                        "update_frequency": "monthly", "budget_allocated": 180, "priority": 6,
+                        "current_state": "9 hospitals commissioned", "target_state": "12 hospitals live",
+                        "lead_measures": [
+                            {
+                                "id": "lm-rhm-1",
+                                "title": "Install ventilator banks per site plan",
+                                "from_value": 0, "to_value": 36, "unit": "units", "current_value": 28,
+                                "deadline": (today + timedelta(days=40)).isoformat(),
+                                "assigned_to": ["Biomedical Engineer"],
+                                "budget_allocated": 60, "priority": 6, "status": "Open",
+                                "current_state": "28 units installed", "target_state": "36 units operational",
+                            },
+                        ],
+                    },
+                ],
+            },
+        ],
+        "documents": [
+            {
+                "project": "Marina Bay Resilience Programme",
+                "wig_id": "wig-mbr-1",
+                "measure_id": "lm-mbr-1",
+                "title": "Sensor Deployment Field Report",
+                "document_type": "Progress Note",
+                "content": "Sensor mesh deployment progressing in Wards 12-15. Telemetry uptime at 94%. Minor firmware rollback required on batch 3 devices. Recommend weekly vendor sync.",
+            },
+            {
+                "project": "Northern Aqueduct Restoration",
+                "title": "Forest Clearance Legal Memo",
+                "document_type": "Statutory Approval",
+                "content": "Forest clearance application pending inter-state review. Legal counsel advises 21-day escalation path via empowered committee. Budget release contingent on clearance milestone.",
+            },
+            {
+                "project": "Trans-European Corridor Upgrade",
+                "title": "Bridge Deck Inspection Summary",
+                "document_type": "Inspection Report",
+                "content": "Package B bridge deck concrete strength tests pass specification. Minor rework needed on expansion joints. Contractor schedule recovery plan submitted.",
+            },
+            {
+                "project": "Regional Hospital Modernisation",
+                "title": "ICU Equipment Procurement Status",
+                "document_type": "Procurement Note",
+                "content": "Ventilator procurement orders issued for remaining 3 sites. Delivery expected within 6 weeks. Biomedical validation SOP updated.",
+            },
+        ],
+        "assignments": [
+            {"project": "Northern Aqueduct Restoration", "title": "Escalate forest clearance to empowered committee", "owner": "Dr. Rahul Verma", "role": "Mission Director", "due_date": (today + timedelta(days=5)).isoformat(), "status": "In Progress", "priority": "Critical", "discipline": "Lead Measures", "decision_needed": "Committee date confirmation required"},
+            {"project": "Marina Bay Resilience Programme", "title": "Close overdue operator training backlog", "owner": "4DX Coach Tan", "role": "PMU Lead", "due_date": (today + timedelta(days=7)).isoformat(), "status": "Open", "priority": "High", "discipline": "Cadence"},
+            {"project": "Trans-European Corridor Upgrade", "title": "Review bridge deck rework schedule", "owner": "Elena Müller", "role": "Project Director", "due_date": (today + timedelta(days=10)).isoformat(), "status": "In Progress", "priority": "Medium", "discipline": "Scoreboard"},
+        ],
+        "decisions": [
+            {"project": "Northern Aqueduct Restoration", "title": "Approve emergency clearance escalation", "decision_type": "Intervention", "requested_by": "Dr. Rahul Verma", "due_date": (today + timedelta(days=3)).isoformat(), "summary": "Forest clearance delay threatens 24x7 supply target. Recommend empowered committee hearing.", "status": "Pending"},
+            {"project": "Marina Bay Resilience Programme", "title": "Release contingency for sensor firmware fix", "decision_type": "Budget", "requested_by": "Ms. Priya Menon", "due_date": (today + timedelta(days=6)).isoformat(), "summary": "Batch 3 firmware rollback requires vendor sprint budget.", "status": "Pending"},
+        ],
+        "approvals": [
+            {"project": "Northern Aqueduct Restoration", "wig_id": "wig-nar-1", "measure_id": "lm-nar-1", "title": "Forest clearance escalation approval", "requested_by": "Officer A", "summary": "Seek approval to escalate clearance via empowered committee.", "due_date": (today + timedelta(days=4)).isoformat(), "status": "Pending"},
+            {"project": "Marina Bay Resilience Programme", "wig_id": "wig-mbr-1", "measure_id": "lm-mbr-2", "title": "Training vendor contract amendment", "requested_by": "PMU Coach Tan", "summary": "Additional training sessions for eastern cluster operators.", "due_date": (today + timedelta(days=8)).isoformat(), "status": "Pending"},
+        ],
+        "notifications": [
+            {"project": "Northern Aqueduct Restoration", "title": "Overdue lead measure", "message": "Move clearance files from 2 to 9 is past deadline.", "severity": "critical", "status": "Open", "due_date": overdue},
+            {"project": "Marina Bay Resilience Programme", "title": "Lead measure due soon", "message": "Train ward operators on escalation protocol due in 3 days.", "severity": "warning", "status": "Open", "due_date": soon},
+        ],
+        "weekly_meetings": [
+            {"project": "Marina Bay Resilience Programme", "meeting_date": (today - timedelta(days=7)).isoformat(), "facilitator": "4DX Coach Tan", "notes": "Reviewed sensor rollout and training backlog. Commitments captured for Ward 7 clearance.", "commitments": ["IoT Lead: firmware patch by Friday", "PMU: schedule 2 makeup training sessions"]},
+            {"project": "Northern Aqueduct Restoration", "meeting_date": (today - timedelta(days=5)).isoformat(), "facilitator": "Dr. Rahul Verma", "notes": "Clearance escalation path agreed. Legal memo attached as evidence.", "commitments": ["Officer A: file empowered committee request", "Finance: hold tranche 3 pending clearance"]},
+        ],
+        "health_snapshots": [
+            {"date": (today - timedelta(days=14)).isoformat(), "health_score": 68},
+            {"date": (today - timedelta(days=7)).isoformat(), "health_score": 71},
+            {"date": today.isoformat(), "health_score": 73},
+        ],
+    }
+
+
+def _parse_dt(value: Any) -> Any:
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00").replace("+00:00", ""))
+        except ValueError:
+            return value
+    return value
+
+
+def _ensure_ids(entity: dict[str, Any], id_key: str = "id") -> None:
+    if not entity.get(id_key):
+        entity[id_key] = str(uuid.uuid4())
+
+
+def _normalize_measure(measure: dict[str, Any]) -> None:
+    _ensure_ids(measure)
+    measure.setdefault("status", "Open")
+    measure.setdefault("comments", [])
+    measure.setdefault("progress_history", [])
+    for comment in measure.get("comments", []):
+        _ensure_ids(comment)
+        comment["created_at"] = _parse_dt(comment.get("created_at")) or datetime.utcnow()
+    for entry in measure.get("progress_history", []):
+        _ensure_ids(entry)
+        entry["created_at"] = _parse_dt(entry.get("created_at")) or datetime.utcnow()
+
+
+def _normalize_wig(wig: dict[str, Any]) -> None:
+    _ensure_ids(wig)
+    wig.setdefault("lead_measures", [])
+    for measure in wig.get("lead_measures", []):
+        _normalize_measure(measure)
+
+
+def load_demo_data(db: Any, data: dict[str, Any], insert_document_fn: Any, vectorize_all_fn: Any, refresh_health_fn: Any) -> dict[str, Any]:
+    """Load demo JSON into MongoDB, preserving users and branding settings."""
+    ministry_ids: dict[str, ObjectId] = {}
+    project_ids: dict[str, ObjectId] = {}
+    project_meta: dict[str, dict[str, Any]] = {}
+
+    for name in DATA_COLLECTIONS:
+        db[name].delete_many({})
+    db.vectors.delete_many({})
+
+    for ministry in data.get("ministries", []):
+        doc = {**ministry, "created_at": datetime.utcnow()}
+        result = db.ministries.insert_one(doc)
+        ministry_ids[ministry["name"]] = result.inserted_id
+
+    for project in data.get("projects", []):
+        ministry_name = project["ministry"]
+        ministry_id = ministry_ids[ministry_name]
+        wigs = project.get("wigs", [])
+        for wig in wigs:
+            _normalize_wig(wig)
+        doc = {
+            k: v for k, v in project.items() if k not in {"ministry", "wigs"}
+        }
+        doc["ministry_id"] = ministry_id
+        doc["ministry"] = ministry_name
+        doc["wigs"] = wigs
+        doc["created_at"] = datetime.utcnow()
+        doc.setdefault("milestones", [])
+        doc.setdefault("lead_measures", [])
+        result = db.projects.insert_one(doc)
+        project_ids[project["name"]] = result.inserted_id
+        project_meta[project["name"]] = {"_id": result.inserted_id, "ministry_id": ministry_id}
+
+    for item in data.get("documents", []):
+        meta = project_meta.get(item["project"])
+        if not meta:
+            continue
+        insert_document_fn(
+            meta["_id"],
+            meta["ministry_id"],
+            item["title"],
+            item.get("document_type", "Progress Note"),
+            item["content"],
+            "demo_seed",
+            wig_id=item.get("wig_id"),
+            measure_id=item.get("measure_id"),
+        )
+
+    for item in data.get("assignments", []):
+        meta = project_meta.get(item["project"])
+        if not meta:
+            continue
+        db.assignments.insert_one({
+            **{k: v for k, v in item.items() if k != "project"},
+            "project_id": meta["_id"],
+            "ministry_id": meta["ministry_id"],
+            "created_at": datetime.utcnow(),
+        })
+
+    for item in data.get("decisions", []):
+        meta = project_meta.get(item["project"])
+        if not meta:
+            continue
+        db.decisions.insert_one({
+            **{k: v for k, v in item.items() if k != "project"},
+            "project_id": meta["_id"],
+            "ministry_id": meta["ministry_id"],
+            "created_at": datetime.utcnow(),
+        })
+
+    for item in data.get("approvals", []):
+        meta = project_meta.get(item["project"])
+        if not meta:
+            continue
+        db.approvals.insert_one({
+            **{k: v for k, v in item.items() if k != "project"},
+            "project_id": meta["_id"],
+            "created_at": datetime.utcnow(),
+        })
+
+    for item in data.get("notifications", []):
+        meta = project_meta.get(item["project"])
+        if not meta:
+            continue
+        db.notifications.insert_one({
+            **{k: v for k, v in item.items() if k != "project"},
+            "project_id": meta["_id"],
+            "created_at": datetime.utcnow(),
+        })
+
+    for item in data.get("weekly_meetings", []):
+        meta = project_meta.get(item["project"])
+        if not meta:
+            continue
+        db.weekly_meetings.insert_one({
+            **{k: v for k, v in item.items() if k != "project"},
+            "project_id": meta["_id"],
+            "created_at": datetime.utcnow(),
+        })
+
+    for item in data.get("health_snapshots", []):
+        db.health_snapshots.insert_one({
+            "date": item["date"],
+            "health_score": item["health_score"],
+            "recorded_at": _parse_dt(item.get("recorded_at")) or datetime.utcnow(),
+        })
+
+    refresh_health_fn(force=True)
+    vectorize_all_fn()
+    db.settings.update_one(
+        {"key": "seed_version"},
+        {"$set": {"value": data.get("version", DEMO_VERSION), "updated_at": datetime.utcnow(), "source": "demo_data"}},
+        upsert=True,
+    )
+    return {"projects": len(project_ids), "ministries": len(ministry_ids), "version": data.get("version", DEMO_VERSION)}
+
+
+def load_bundled_demo_data(db: Any, insert_document_fn: Any, vectorize_all_fn: Any, refresh_health_fn: Any, path: str | None = None) -> dict[str, Any]:
+    demo_path = path or os.path.join(os.path.dirname(__file__), "demo_data.json")
+    if os.path.exists(demo_path):
+        with open(demo_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    else:
+        data = build_demo_dataset()
+        with open(demo_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+    return load_demo_data(db, data, insert_document_fn, vectorize_all_fn, refresh_health_fn)
+
+
+def list_orphan_collections(db: Any) -> list[dict[str, Any]]:
+    existing = set(db.list_collection_names())
+    orphans = sorted(existing - ALLOWED_COLLECTIONS)
+    result = []
+    for name in orphans:
+        try:
+            count = db[name].count_documents({})
+        except Exception:
+            count = -1
+        result.append({"name": name, "count": count, "safe_to_drop": count == 0})
+    return result
+
+
+def cleanup_orphan_collections(db: Any, dry_run: bool = True) -> dict[str, Any]:
+    orphans = list_orphan_collections(db)
+    dropped = []
+    skipped = []
+    for item in orphans:
+        if item["safe_to_drop"]:
+            if not dry_run:
+                db[item["name"]].drop()
+            dropped.append(item["name"])
+        else:
+            skipped.append(item)
+    return {"dry_run": dry_run, "dropped": dropped, "skipped": skipped, "orphans": orphans}

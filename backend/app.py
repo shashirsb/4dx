@@ -1,4 +1,6 @@
 import base64
+import csv
+import io
 import hashlib
 import json
 import math
@@ -7,32 +9,71 @@ import random
 import re
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
-import fitz
 from bson import ObjectId
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-MONGODB_URI = os.getenv(
-    "MONGODB_URI",
-    "mongodb+srv://main_user:main_user@cluster0.88oefbe.mongodb.net/?appName=Cluster0",
+from demo_dataset import (
+    ALLOWED_COLLECTIONS,
+    build_demo_dataset,
+    cleanup_orphan_collections,
+    list_orphan_collections,
+    load_bundled_demo_data,
+    load_demo_data,
 )
+from meeting_to_action import apply_meeting_to_action, apply_ministry_meeting_to_action, build_ministry_catalog, build_project_catalog, parse_meeting_notes
+from llm_client import (
+    call_llm_json,
+    decision_brief_payload_valid,
+    format_fallback_status,
+    get_llm_provider_status,
+    insight_ask_payload_valid,
+    insight_payload_valid,
+    portfolio_insight_payload_valid,
+    sanitize_llm_status,
+)
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+MONGODB_URI = os.getenv("MONGODB_URI", "")
 DB_NAME = os.getenv("DB_NAME", "4dx_dashboard")
+SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "24"))
+def normalize_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", (phone or "").strip())
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    return digits
+
+
+ADMIN_PHONES = {
+    normalize_phone(phone)
+    for phone in os.getenv("ADMIN_PHONES", "9999900000").split(",")
+    if phone.strip()
+}
+DEMO_OTP_MODE = os.getenv("DEMO_OTP_MODE", "true").lower() in {"1", "true", "yes"}
+HEALTH_REFRESH_MINUTES = int(os.getenv("HEALTH_REFRESH_MINUTES", "5"))
 EMBEDDING_DIMS = 128
 HF_EMBEDDING_MODEL = os.getenv("HF_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 SEED_VERSION = "milestone_leadmeasure_vector_v2"
+APP_MODE = os.getenv("APP_MODE", "prod").lower()
+DEMO_DATA_PATH = os.path.join(os.path.dirname(__file__), "demo_data.json")
 HEALTH_STATES = {"green", "amber", "red", "blocker", "approval", "hold"}
+UPDATE_FREQUENCIES = {"daily", "weekly", "bi-weekly", "monthly"}
+FREQUENCY_DAYS = {"daily": 1, "weekly": 7, "bi-weekly": 14, "monthly": 30}
 _hf_model: Any = None
 _hf_model_error: str | None = None
+_health_cache_at: datetime | None = None
 
-app = FastAPI(title="4DX Government Execution API")
+app = FastAPI(title="4DX Execution Platform API")
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^http://(127\.0\.0\.1|localhost):517[0-9]$",
@@ -40,6 +81,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if not MONGODB_URI:
+    raise RuntimeError("MONGODB_URI environment variable is required. Copy backend/.env.example to backend/.env")
 
 client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
 db = client[DB_NAME]
@@ -63,6 +107,17 @@ class ProjectIn(BaseModel):
     wig: str | None = None
     due_date: str
     budget_crore: float = Field(ge=0)
+    priority: int = Field(default=5, ge=1, le=10)
+
+
+class ProjectUpdateIn(BaseModel):
+    name: str | None = None
+    owner: str | None = None
+    current_state: str | None = None
+    target_state: str | None = None
+    due_date: str | None = None
+    budget_crore: float | None = Field(default=None, ge=0)
+    priority: int | None = Field(default=None, ge=1, le=10)
 
 
 class WigIn(BaseModel):
@@ -74,6 +129,9 @@ class WigIn(BaseModel):
     unit: str
     deadline: str
     owner: str
+    priority: int | None = Field(default=None, ge=1, le=10)
+    update_frequency: str = "weekly"
+    budget_allocated: float = Field(default=0, ge=0)
 
 
 class WigUpdateIn(BaseModel):
@@ -85,6 +143,9 @@ class WigUpdateIn(BaseModel):
     unit: str | None = None
     deadline: str | None = None
     owner: str | None = None
+    priority: int | None = Field(default=None, ge=1, le=10)
+    update_frequency: str | None = None
+    budget_allocated: float | None = Field(default=None, ge=0)
 
 
 class LeadMeasureIn(BaseModel):
@@ -96,6 +157,8 @@ class LeadMeasureIn(BaseModel):
     unit: str
     deadline: str
     assigned_to: list[str]
+    priority: int | None = Field(default=None, ge=1, le=10)
+    budget_allocated: float = Field(default=0, ge=0)
 
 
 class LeadMeasureUpdateIn(BaseModel):
@@ -109,6 +172,8 @@ class LeadMeasureUpdateIn(BaseModel):
     deadline: str | None = None
     assigned_to: list[str] | None = None
     status: str | None = None
+    priority: int | None = Field(default=None, ge=1, le=10)
+    budget_allocated: float | None = Field(default=None, ge=0)
 
 
 class LeadProgressIn(BaseModel):
@@ -172,6 +237,28 @@ class AIDecisionIn(BaseModel):
     question: str | None = None
 
 
+class AIInsightIn(BaseModel):
+    question: str | None = None
+    preset: str | None = None
+    stale_days: int = Field(default=7, ge=1, le=90)
+
+
+class ContextualInsightAskIn(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+
+
+class MeetingNotesIn(BaseModel):
+    notes: str
+    ministry_id: str | None = None
+
+
+class MeetingToActionApplyIn(BaseModel):
+    ministry_id: str | None = None
+    proposed_wigs: list[dict[str, Any]] = []
+    proposed_measures: list[dict[str, Any]] = []
+    proposed_actions: list[dict[str, Any]] = []
+
+
 class DocumentIn(BaseModel):
     project_id: str
     wig_id: str | None = None
@@ -186,6 +273,32 @@ class SettingsIn(BaseModel):
     department: str | None = None
     banner: str | None = None
     logo_url: str | None = None
+    locale: str | None = None
+    region: str | None = None
+    currency: str | None = None
+    timezone: str | None = None
+    org_type: str | None = None
+
+
+class AppModeIn(BaseModel):
+    mode: str
+    auto_load_demo: bool = False
+    confirm_reseed: bool = False
+
+
+REGION_CATALOG = [
+    {"id": "global", "label": "Global / Multi-region", "currency": "USD", "timezone": "UTC", "org_type": "enterprise"},
+    {"id": "sg", "label": "Singapore", "currency": "SGD", "timezone": "Asia/Singapore", "org_type": "public_sector"},
+    {"id": "cn", "label": "China", "currency": "CNY", "timezone": "Asia/Shanghai", "org_type": "public_sector"},
+    {"id": "in", "label": "India", "currency": "INR", "timezone": "Asia/Kolkata", "org_type": "government"},
+    {"id": "eu", "label": "European Union", "currency": "EUR", "timezone": "Europe/Brussels", "org_type": "public_sector"},
+    {"id": "uk", "label": "United Kingdom", "currency": "GBP", "timezone": "Europe/London", "org_type": "government"},
+    {"id": "de", "label": "Germany", "currency": "EUR", "timezone": "Europe/Berlin", "org_type": "public_sector"},
+    {"id": "fr", "label": "France", "currency": "EUR", "timezone": "Europe/Paris", "org_type": "government"},
+    {"id": "us", "label": "United States", "currency": "USD", "timezone": "America/New_York", "org_type": "enterprise"},
+    {"id": "jp", "label": "Japan", "currency": "JPY", "timezone": "Asia/Tokyo", "org_type": "public_sector"},
+    {"id": "au", "label": "Australia", "currency": "AUD", "timezone": "Australia/Sydney", "org_type": "government"},
+]
 
 
 def oid(value: str) -> ObjectId:
@@ -214,7 +327,14 @@ def clean_id(doc: dict[str, Any] | None) -> dict[str, Any] | None:
 def token_for(user: dict[str, Any]) -> str:
     raw = f"{user['phone']}:{user['role']}:{int(time.time())}:{uuid.uuid4()}"
     token = base64.urlsafe_b64encode(raw.encode()).decode()
-    db.sessions.insert_one({"token": token, "phone": user["phone"], "role": user["role"], "created_at": datetime.utcnow()})
+    expires_at = datetime.utcnow() + timedelta(hours=SESSION_TTL_HOURS)
+    db.sessions.insert_one({
+        "token": token,
+        "phone": user["phone"],
+        "role": user["role"],
+        "created_at": datetime.utcnow(),
+        "expires_at": expires_at,
+    })
     return token
 
 
@@ -225,6 +345,10 @@ def current_user(authorization: str | None = Header(default=None)) -> dict[str, 
     session = db.sessions.find_one({"token": token})
     if not session:
         raise HTTPException(status_code=401, detail="Invalid session")
+    expires_at = session.get("expires_at")
+    if expires_at and expires_at < datetime.utcnow():
+        db.sessions.delete_one({"_id": session["_id"]})
+        raise HTTPException(status_code=401, detail="Session expired")
     user = db.users.find_one({"phone": session["phone"]})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
@@ -239,6 +363,8 @@ def require_admin(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any
 
 def can_edit_project(project: dict[str, Any], user: dict[str, Any]) -> bool:
     if user.get("role") == "admin":
+        return True
+    if DEMO_OTP_MODE:
         return True
     phone = user.get("phone")
     return bool(phone and (project.get("created_by") == phone or phone in project.get("authorized_users", [])))
@@ -317,7 +443,7 @@ def refresh_project_sla_notifications(project: dict[str, Any]) -> None:
             except ValueError:
                 continue
             remaining = (due - today).days
-            if remaining < 0 and measure.get("status") != "Done":
+            if remaining < 0 and not measure_is_complete(measure):
                 key = f"overdue:{measure.get('id')}"
                 if not db.notifications.find_one({"project_id": project["_id"], "metadata.key": key, "status": "Open"}):
                     create_notification(project, "Overdue lead measure", f"{measure.get('title')} is past deadline.", "critical", deadline)
@@ -467,9 +593,50 @@ def startup() -> None:
         print(f"MongoDB connection failed: {exc}")
 
 
+def get_app_mode() -> str:
+    doc = db.settings.find_one({"key": "app_mode"})
+    if doc and doc.get("mode") in {"dev", "prod"}:
+        return doc["mode"]
+    return "dev" if APP_MODE == "dev" else "prod"
+
+
+def ensure_app_mode() -> None:
+    existing = db.settings.find_one({"key": "app_mode"})
+    default_mode = "dev" if APP_MODE == "dev" else "prod"
+    if not existing:
+        db.settings.insert_one({
+            "key": "app_mode",
+            "mode": default_mode,
+            "auto_load_demo": default_mode == "dev",
+            "updated_at": datetime.utcnow(),
+        })
+
+
+def set_app_mode(mode: str, auto_load_demo: bool | None = None) -> dict[str, Any]:
+    normalized = mode.lower()
+    if normalized not in {"dev", "prod"}:
+        raise HTTPException(status_code=400, detail="mode must be dev or prod")
+    patch: dict[str, Any] = {"mode": normalized, "updated_at": datetime.utcnow()}
+    if auto_load_demo is not None:
+        patch["auto_load_demo"] = auto_load_demo
+    db.settings.update_one({"key": "app_mode"}, {"$set": patch}, upsert=True)
+    doc = db.settings.find_one({"key": "app_mode"}, {"_id": 0, "key": 0}) or {}
+    return {"app_mode": doc.get("mode", normalized), "auto_load_demo": bool(doc.get("auto_load_demo"))}
+
+
+def reseed_demo_payload(data: dict[str, Any] | None = None) -> dict[str, Any]:
+    if data is None:
+        result = load_bundled_demo_data(db, insert_document, vectorize_all_entities, refresh_all_project_health, DEMO_DATA_PATH)
+    else:
+        result = load_demo_data(db, data, insert_document, vectorize_all_entities, refresh_all_project_health)
+    try_create_vector_index()
+    return result
+
+
 def seed_database() -> None:
     db.users.create_index("phone", unique=True)
     db.sessions.create_index("token", unique=True)
+    db.sessions.create_index("expires_at", expireAfterSeconds=0)
     db.otp_requests.create_index("phone")
     db.projects.create_index("ministry_id")
     db.documents.create_index("project_id")
@@ -482,32 +649,50 @@ def seed_database() -> None:
     db.approvals.create_index([("project_id", 1), ("status", 1)])
     db.notifications.create_index([("project_id", 1), ("status", 1)])
     db.weekly_meetings.create_index([("project_id", 1), ("meeting_date", -1)])
+    db.health_snapshots.create_index([("recorded_at", -1)])
     ensure_branding()
+    ensure_app_mode()
     meta = db.settings.find_one({"key": "seed_version"})
-    if meta and meta.get("value") == SEED_VERSION and db.projects.count_documents({}) >= 10:
-        refresh_all_project_health()
+    if meta and meta.get("value") and db.projects.count_documents({}) > 0:
+        refresh_all_project_health(force=True)
         return
+    cleanup_orphan_collections(db, dry_run=False)
+    if db.projects.count_documents({}) == 0 and get_app_mode() == "dev":
+        app_mode_doc = db.settings.find_one({"key": "app_mode"}) or {}
+        if app_mode_doc.get("auto_load_demo", True):
+            reseed_demo_payload()
+            return
     for name in ("ministries", "projects", "documents", "vectors", "assignments", "decisions"):
         db[name].delete_many({})
     ministries = seed_ministries()
     projects = seed_projects(ministries)
     seed_documents(projects)
     seed_assignments_and_decisions(projects)
-    refresh_all_project_health()
+    refresh_all_project_health(force=True)
     vectorize_all_entities()
     db.settings.update_one({"key": "seed_version"}, {"$set": {"value": SEED_VERSION, "updated_at": datetime.utcnow()}}, upsert=True)
     try_create_vector_index()
 
 
 def ensure_branding() -> None:
-    if not db.settings.find_one({"key": "branding"}):
-        db.settings.insert_one({
-            "key": "branding",
-            "title": "Government 4DX Execution Dashboard",
-            "department": "Chief Minister Delivery Unit",
-            "banner": "High level view. Right insights. Timely interventions. Better outcomes.",
-            "logo_url": "",
-        })
+    defaults = {
+        "title": "4DX Execution Platform",
+        "department": "Strategic Delivery Office",
+        "banner": "Focus. Measure. Score. Execute. — The 4 Disciplines of Execution for any organisation.",
+        "logo_url": "",
+        "locale": "en",
+        "region": "global",
+        "currency": "USD",
+        "timezone": "UTC",
+        "org_type": "enterprise",
+    }
+    existing = db.settings.find_one({"key": "branding"})
+    if not existing:
+        db.settings.insert_one({"key": "branding", **defaults})
+        return
+    patch = {k: v for k, v in defaults.items() if not existing.get(k)}
+    if patch:
+        db.settings.update_one({"key": "branding"}, {"$set": patch})
 
 
 def seed_ministries() -> dict[str, ObjectId]:
@@ -553,7 +738,7 @@ def seed_projects(ministries: dict[str, ObjectId]) -> list[dict[str, Any]]:
             {"name": "Approvals cleared", "target": 8, "actual": max(1, round(8 * compliance / 100)), "unit": "items"},
             {"name": "Critical commitments closed", "target": 10, "actual": max(1, round(10 * cadence / 100)), "unit": "commitments"},
         ]
-        wigs = build_seed_wigs(name, wig, today, idx, schedule, lead, compliance, cadence)
+        wigs = build_seed_wigs(name, wig, today, idx, schedule, lead, compliance, cadence, budget)
         doc = {
             "name": name,
             "ministry_id": ministries[ministry],
@@ -689,10 +874,12 @@ def state_from_score(score: float) -> str:
     return "red"
 
 
-def build_seed_wigs(project_name: str, main_wig: str, today: datetime.date, idx: int, schedule: int, lead: int, compliance: int, cadence: int) -> list[dict[str, Any]]:
+def build_seed_wigs(project_name: str, main_wig: str, today: datetime.date, idx: int, schedule: int, lead: int, compliance: int, cadence: int, budget_crore: float = 0) -> list[dict[str, Any]]:
     first_deadline = (today + timedelta(days=55 + idx * 9)).isoformat()
     final_deadline = (today + timedelta(days=110 + idx * 13)).isoformat()
     blocker_state = "blocker" if schedule < 55 else "approval" if compliance < 65 else state_from_score(lead)
+    wig_one_budget = round(budget_crore * 0.58, 1) if budget_crore else 0
+    wig_two_budget = round(budget_crore * 0.32, 1) if budget_crore else 0
     return [
         {
             "id": str(uuid.uuid4()),
@@ -704,6 +891,9 @@ def build_seed_wigs(project_name: str, main_wig: str, today: datetime.date, idx:
             "unit": "% completion",
             "deadline": final_deadline,
             "owner": "Mission Director",
+            "update_frequency": "weekly",
+            "budget_allocated": wig_one_budget,
+            "priority": 7 if schedule < 60 else 5,
             "lead_measures": [
                 {
                     "id": str(uuid.uuid4()),
@@ -715,6 +905,8 @@ def build_seed_wigs(project_name: str, main_wig: str, today: datetime.date, idx:
                     "unit": "% verified",
                     "deadline": first_deadline,
                     "assigned_to": ["Project Director", "District Nodal Officer"],
+                    "budget_allocated": round(wig_one_budget * 0.45, 1) if wig_one_budget else 0,
+                    "priority": 6,
                     "comments": [
                         {
                             "id": str(uuid.uuid4()),
@@ -735,6 +927,8 @@ def build_seed_wigs(project_name: str, main_wig: str, today: datetime.date, idx:
                     "unit": "% closed",
                     "deadline": first_deadline,
                     "assigned_to": ["Department Secretary", "Finance Representative"],
+                    "budget_allocated": round(wig_one_budget * 0.35, 1) if wig_one_budget else 0,
+                    "priority": 5,
                     "comments": [
                         {
                             "id": str(uuid.uuid4()),
@@ -757,6 +951,9 @@ def build_seed_wigs(project_name: str, main_wig: str, today: datetime.date, idx:
             "unit": "% weekly commitments closed",
             "deadline": first_deadline,
             "owner": "PMU Lead",
+            "update_frequency": "bi-weekly",
+            "budget_allocated": wig_two_budget,
+            "priority": 4,
             "lead_measures": [
                 {
                     "id": str(uuid.uuid4()),
@@ -768,6 +965,8 @@ def build_seed_wigs(project_name: str, main_wig: str, today: datetime.date, idx:
                     "unit": "% actions",
                     "deadline": first_deadline,
                     "assigned_to": ["PMU Lead", "Project Director"],
+                    "budget_allocated": round(wig_two_budget * 0.7, 1) if wig_two_budget else 0,
+                    "priority": 4,
                     "comments": [
                         {
                             "id": str(uuid.uuid4()),
@@ -786,11 +985,22 @@ def build_seed_wigs(project_name: str, main_wig: str, today: datetime.date, idx:
 def flatten_project_states(project: dict[str, Any]) -> list[str]:
     states: list[str] = []
     for wig in project.get("wigs", []):
+        if wig.get("archived_at"):
+            continue
+        if entity_is_overdue(wig, complete_fn=wig_is_complete):
+            overdue_days = days_past_deadline(wig.get("deadline")) or 0
+            progress = progress_percent(
+                wig.get("from_value", 0),
+                wig.get("to_value", 0),
+                wig.get("current_value", wig.get("from_value", 0)),
+            )
+            states.append("blocker" if overdue_days > 7 or progress < 30 else "red")
         for measure in wig.get("lead_measures", []):
-            for comment in measure.get("comments", []):
-                state = str(comment.get("health_state", "")).lower()
-                if state:
-                    states.append(state)
+            if measure.get("archived_at"):
+                continue
+            state = measure_health_state(measure)
+            if state != "archived":
+                states.append(state)
     return states
 
 
@@ -919,6 +1129,7 @@ def summarize_document(content: str, risk: dict[str, Any], measure: dict[str, An
 
 def extract_pdf_text(raw: bytes) -> str:
     try:
+        import fitz
         with fitz.open(stream=raw, filetype="pdf") as pdf:
             pages = []
             for page in pdf:
@@ -928,6 +1139,8 @@ def extract_pdf_text(raw: bytes) -> str:
                 if sum(len(item) for item in pages) > 30000:
                     break
             return "\n\n".join(pages).strip()
+    except ImportError:
+        return ""
     except Exception:
         return ""
 
@@ -1052,6 +1265,15 @@ def calculate_project_health(project: dict[str, Any]) -> dict[str, Any]:
         bottlenecks["Approval Required"] = bottlenecks.get("Approval Required", 0) + state_counts["approval"]
     if state_counts.get("hold", 0):
         bottlenecks["On Hold"] = bottlenecks.get("On Hold", 0) + state_counts["hold"]
+    overdue_count = 0
+    for wig in project.get("wigs", []):
+        if not wig.get("archived_at") and entity_is_overdue(wig, complete_fn=wig_is_complete):
+            overdue_count += 1
+        for measure in wig.get("lead_measures", []):
+            if not measure.get("archived_at") and entity_is_overdue(measure, complete_fn=measure_is_complete):
+                overdue_count += 1
+    if overdue_count:
+        bottlenecks["Overdue Items"] = bottlenecks.get("Overdue Items", 0) + overdue_count
     top = sorted(bottlenecks.items(), key=lambda item: item[1], reverse=True)[:4]
     recommendations = build_recommendations(health, [name for name, _ in top], project)
     return {
@@ -1089,7 +1311,7 @@ def build_recommendations(health: int, bottlenecks: list[str], project: dict[str
     return recs[:4]
 
 
-def refresh_project_health(project_id: ObjectId) -> dict[str, Any]:
+def refresh_project_health(project_id: ObjectId, *, vectorize: bool = True) -> dict[str, Any]:
     project = db.projects.find_one({"_id": project_id})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -1097,16 +1319,116 @@ def refresh_project_health(project_id: ObjectId) -> dict[str, Any]:
     db.projects.update_one({"_id": project_id}, {"$set": health})
     refreshed = db.projects.find_one({"_id": project_id})
     refresh_project_sla_notifications(refreshed)
-    vectorize_project_entities(refreshed)
+    if vectorize:
+        vectorize_project_entities(refreshed)
     return refreshed
 
 
-def refresh_all_project_health() -> None:
+def refresh_all_project_health(force: bool = False) -> None:
+    global _health_cache_at
+    now = datetime.utcnow()
+    if not force and _health_cache_at and (now - _health_cache_at).total_seconds() < HEALTH_REFRESH_MINUTES * 60:
+        return
+    scores: list[int] = []
     for project in db.projects.find({}):
         health = calculate_project_health(project)
         db.projects.update_one({"_id": project["_id"]}, {"$set": health})
         refreshed = db.projects.find_one({"_id": project["_id"]})
         refresh_project_sla_notifications(refreshed)
+        scores.append(health["health_score"])
+    if scores:
+        record_portfolio_health_snapshot(round(sum(scores) / len(scores)))
+    _health_cache_at = now
+
+
+def record_portfolio_health_snapshot(health_score: int) -> None:
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    existing = db.health_snapshots.find_one({"date": today})
+    if existing:
+        db.health_snapshots.update_one({"_id": existing["_id"]}, {"$set": {"health_score": health_score, "recorded_at": datetime.utcnow()}})
+    else:
+        db.health_snapshots.insert_one({"date": today, "health_score": health_score, "recorded_at": datetime.utcnow()})
+
+
+def portfolio_health_trend(limit: int = 8) -> list[dict[str, Any]]:
+    rows = list(db.health_snapshots.find().sort("recorded_at", -1).limit(limit))
+    if len(rows) < 2:
+        return []
+    rows.reverse()
+    return [{"name": row["date"][-5:], "value": row["health_score"]} for row in rows]
+
+
+def measure_health_state(measure: dict[str, Any]) -> str:
+    if measure.get("archived_at"):
+        return "archived"
+    progress = progress_percent(
+        measure.get("from_value", 0),
+        measure.get("to_value", 0),
+        measure.get("current_value", measure.get("from_value", 0)),
+    )
+    if entity_is_overdue(measure, complete_fn=measure_is_complete):
+        overdue_days = days_past_deadline(measure.get("deadline")) or 0
+        if overdue_days > 7 or progress < 30:
+            return "blocker"
+        return "red"
+    comments = measure.get("comments") or []
+    if comments:
+        return str(comments[-1].get("health_state", "green")).lower()
+    deadline = measure.get("deadline")
+    if deadline:
+        try:
+            remaining = (datetime.fromisoformat(deadline).date() - datetime.utcnow().date()).days
+            if remaining <= 7 and progress < 70:
+                return "amber"
+        except ValueError:
+            pass
+    if progress >= 85:
+        return "green"
+    if progress >= 50:
+        return "amber"
+    return "green"
+
+
+def progress_percent(from_value: float, to_value: float, current_value: float) -> int:
+    span = to_value - from_value
+    if span == 0:
+        return 100 if current_value >= to_value else 0
+    return max(0, min(100, round(((current_value - from_value) / span) * 100)))
+
+
+def build_scoreboard_rows() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for project in db.projects.find().sort("health_score", 1):
+        for wig in project.get("wigs", []):
+            if wig.get("archived_at"):
+                continue
+            for measure in wig.get("lead_measures", []):
+                if measure.get("archived_at"):
+                    continue
+                state = measure_health_state(measure)
+                progress = progress_percent(
+                    measure.get("from_value", 0),
+                    measure.get("to_value", 0),
+                    measure.get("current_value", measure.get("from_value", 0)),
+                )
+                rows.append({
+                    "project_id": str(project["_id"]),
+                    "project_name": project["name"],
+                    "ministry": project.get("ministry"),
+                    "wig_id": wig.get("id"),
+                    "wig_title": wig.get("title"),
+                    "measure_id": measure.get("id"),
+                    "measure_title": measure.get("title"),
+                    "owner": ", ".join(measure.get("assigned_to") or []) or wig.get("owner") or project.get("owner"),
+                    "deadline": measure.get("deadline"),
+                    "progress": progress,
+                    "health_state": state,
+                    "status": measure.get("status", "Open"),
+                    "is_overdue": entity_is_overdue(measure, complete_fn=measure_is_complete),
+                })
+    state_order = {"blocker": 0, "red": 1, "approval": 2, "hold": 3, "amber": 4, "green": 5}
+    rows.sort(key=lambda row: (state_order.get(row["health_state"], 6), row["progress"]))
+    return rows
 
 
 def try_create_vector_index() -> dict[str, Any]:
@@ -1410,11 +1732,6 @@ def normalize_decision_brief(brief: dict[str, Any]) -> dict[str, Any]:
 
 
 def openai_decision_brief(context: dict[str, Any], question: str | None = None) -> dict[str, Any]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        brief = local_decision_brief(context)
-        brief["llm_status"] = "OPENAI_API_KEY not configured; used local decision engine."
-        return normalize_decision_brief(brief)
     system = (
         "You are a senior government 4DX execution advisor. "
         "Turn project health, WIGs, lead measures, evidence, approvals, alerts, and vector matches into a concise executive decision brief. "
@@ -1436,26 +1753,1613 @@ def openai_decision_brief(context: dict[str, Any], question: str | None = None) 
         "required_json_shape": schema_hint,
         "context": context,
     }
-    try:
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(prompt, default=str)[:24000]},
-            ],
-        )
-        content = response.choices[0].message.content or "{}"
-        data = json.loads(content)
-        data["mode"] = "openai_llm"
-        data["model"] = OPENAI_MODEL
+    llm = call_llm_json(system, json.dumps(prompt, default=str), validate=decision_brief_payload_valid)
+    if llm["data"]:
+        data = llm["data"]
+        data["mode"] = f"{llm['provider']}_llm"
+        data["model"] = llm["model"]
+        data["llm_status"] = sanitize_llm_status(llm["llm_status"])
         return normalize_decision_brief(data)
-    except Exception as exc:
-        brief = local_decision_brief(context)
-        brief["llm_status"] = f"OpenAI generation failed; used local decision engine. {exc}"
-        return normalize_decision_brief(brief)
+    brief = local_decision_brief(context)
+    brief["llm_status"] = sanitize_llm_status(llm.get("llm_status"))
+    return normalize_decision_brief(brief)
+
+
+def _to_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
+    return None
+
+
+def active_wigs(project: dict[str, Any]) -> list[dict[str, Any]]:
+    return [wig for wig in project.get("wigs", []) if not wig.get("archived_at")]
+
+
+def active_measures(wig: dict[str, Any]) -> list[dict[str, Any]]:
+    return [measure for measure in wig.get("lead_measures", []) if not measure.get("archived_at")]
+
+
+def normalize_update_frequency(value: str | None) -> str:
+    freq = (value or "weekly").strip().lower()
+    if freq not in UPDATE_FREQUENCIES:
+        raise HTTPException(status_code=400, detail=f"update_frequency must be one of {sorted(UPDATE_FREQUENCIES)}")
+    return freq
+
+
+def frequency_stale_days(frequency: str | None) -> int:
+    return FREQUENCY_DAYS.get((frequency or "weekly").strip().lower(), 7)
+
+
+def parse_iso_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).date()
+    except ValueError:
+        return None
+
+
+def measure_is_complete(measure: dict[str, Any]) -> bool:
+    if measure.get("archived_at"):
+        return True
+    status = str(measure.get("status", "")).lower()
+    if status in {"done", "closed", "complete", "completed"}:
+        return True
+    progress = progress_percent(
+        measure.get("from_value", 0),
+        measure.get("to_value", 0),
+        measure.get("current_value", measure.get("from_value", 0)),
+    )
+    return progress >= 100
+
+
+def wig_is_complete(wig: dict[str, Any]) -> bool:
+    if wig.get("archived_at"):
+        return True
+    progress = progress_percent(
+        wig.get("from_value", 0),
+        wig.get("to_value", 0),
+        wig.get("current_value", wig.get("from_value", 0)),
+    )
+    return progress >= 100
+
+
+def is_past_deadline(deadline: str | None) -> bool:
+    due = parse_iso_date(deadline)
+    if not due:
+        return False
+    return datetime.utcnow().date() > due
+
+
+def days_past_deadline(deadline: str | None) -> int | None:
+    due = parse_iso_date(deadline)
+    if not due:
+        return None
+    return (datetime.utcnow().date() - due).days
+
+
+def entity_is_overdue(entity: dict[str, Any], *, complete_fn) -> bool:
+    if complete_fn(entity):
+        return False
+    return is_past_deadline(entity.get("deadline"))
+
+
+def validate_wig_deadline(project: dict[str, Any], deadline: str | None) -> None:
+    project_due = parse_iso_date(project.get("due_date"))
+    wig_due = parse_iso_date(deadline)
+    if project_due and wig_due and wig_due > project_due:
+        raise HTTPException(
+            status_code=400,
+            detail=f"WIG deadline cannot exceed project deadline ({project.get('due_date')})",
+        )
+
+
+def measure_deadline_cap(project: dict[str, Any], wig: dict[str, Any]) -> tuple[date | None, str | None]:
+    caps: list[tuple[date, str, str]] = []
+    project_due = parse_iso_date(project.get("due_date"))
+    wig_due = parse_iso_date(wig.get("deadline"))
+    if project_due:
+        caps.append((project_due, "project deadline", project.get("due_date") or ""))
+    if wig_due:
+        caps.append((wig_due, "WIG deadline", wig.get("deadline") or ""))
+    if not caps:
+        return None, None
+    cap_date, cap_label, cap_value = min(caps, key=lambda item: item[0])
+    return cap_date, f"{cap_label} ({cap_value})"
+
+
+def validate_measure_deadline(project: dict[str, Any], wig: dict[str, Any], deadline: str | None) -> None:
+    measure_due = parse_iso_date(deadline)
+    if not measure_due:
+        return
+    cap_date, cap_label = measure_deadline_cap(project, wig)
+    if cap_date and measure_due > cap_date:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Lead measure deadline cannot exceed {cap_label}",
+        )
+
+
+def sum_wig_budgets(project: dict[str, Any], exclude_wig_id: str | None = None) -> float:
+    total = 0.0
+    for wig in active_wigs(project):
+        if exclude_wig_id and wig.get("id") == exclude_wig_id:
+            continue
+        total += float(wig.get("budget_allocated") or 0)
+    return round(total, 4)
+
+
+def sum_measure_budgets(wig: dict[str, Any], exclude_measure_id: str | None = None) -> float:
+    total = 0.0
+    for measure in active_measures(wig):
+        if exclude_measure_id and measure.get("id") == exclude_measure_id:
+            continue
+        total += float(measure.get("budget_allocated") or 0)
+    return round(total, 4)
+
+
+def validate_project_wig_budget(project: dict[str, Any], additional: float = 0.0, exclude_wig_id: str | None = None) -> None:
+    project_budget = float(project.get("budget_crore") or 0)
+    if project_budget <= 0:
+        return
+    allocated = sum_wig_budgets(project, exclude_wig_id=exclude_wig_id) + float(additional or 0)
+    if allocated > project_budget + 0.001:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Total WIG budget ({allocated:.1f} Cr) exceeds project budget ({project_budget:.1f} Cr)",
+        )
+
+
+def validate_wig_measure_budget(wig: dict[str, Any], additional: float = 0.0, exclude_measure_id: str | None = None) -> None:
+    wig_budget = float(wig.get("budget_allocated") or 0)
+    if wig_budget <= 0:
+        return
+    allocated = sum_measure_budgets(wig, exclude_measure_id=exclude_measure_id) + float(additional or 0)
+    if allocated > wig_budget + 0.001:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Total lead measure budget ({allocated:.1f} Cr) exceeds WIG budget ({wig_budget:.1f} Cr)",
+        )
+
+
+def collect_budget_context(projects: list[dict[str, Any]]) -> dict[str, Any]:
+    portfolio_total = 0.0
+    portfolio_spent = 0.0
+    portfolio_wig_allocated = 0.0
+    over_allocated_projects: list[dict[str, Any]] = []
+    over_spent_projects: list[dict[str, Any]] = []
+    wig_budget_issues: list[dict[str, Any]] = []
+    measure_budget_issues: list[dict[str, Any]] = []
+
+    for project in projects:
+        project_budget = float(project.get("budget_crore") or 0)
+        spent = float(project.get("spent_crore") or 0)
+        wigs = active_wigs(project)
+        wig_allocated = sum(float(w.get("budget_allocated") or 0) for w in wigs)
+        portfolio_total += project_budget
+        portfolio_spent += spent
+        portfolio_wig_allocated += wig_allocated
+
+        if project_budget > 0 and spent > project_budget:
+            over_spent_projects.append({
+                "project": project.get("name"),
+                "budget_crore": project_budget,
+                "spent_crore": spent,
+                "variance_crore": round(spent - project_budget, 1),
+            })
+        if project_budget > 0 and wig_allocated > project_budget:
+            over_allocated_projects.append({
+                "project": project.get("name"),
+                "budget_crore": project_budget,
+                "wig_allocated_crore": round(wig_allocated, 1),
+                "variance_crore": round(wig_allocated - project_budget, 1),
+            })
+
+        for wig in wigs:
+            wig_budget = float(wig.get("budget_allocated") or 0)
+            measures = active_measures(wig)
+            measure_allocated = sum(float(m.get("budget_allocated") or 0) for m in measures)
+            if wig_budget > 0 and measure_allocated > wig_budget:
+                wig_budget_issues.append({
+                    "project": project.get("name"),
+                    "wig": wig.get("title"),
+                    "wig_budget_crore": wig_budget,
+                    "measure_allocated_crore": round(measure_allocated, 1),
+                    "variance_crore": round(measure_allocated - wig_budget, 1),
+                })
+            for measure in measures:
+                measure_budget = float(measure.get("budget_allocated") or 0)
+                if measure_budget <= 0:
+                    continue
+                if wig_budget > 0 and measure_budget > wig_budget:
+                    measure_budget_issues.append({
+                        "project": project.get("name"),
+                        "wig": wig.get("title"),
+                        "measure": measure.get("title"),
+                        "measure_budget_crore": measure_budget,
+                        "wig_budget_crore": wig_budget,
+                    })
+
+    return {
+        "portfolio_budget_crore": round(portfolio_total, 1),
+        "portfolio_spent_crore": round(portfolio_spent, 1),
+        "portfolio_wig_allocated_crore": round(portfolio_wig_allocated, 1),
+        "over_spent_projects": over_spent_projects[:8],
+        "over_allocated_projects": over_allocated_projects[:8],
+        "wig_measure_overruns": wig_budget_issues[:10],
+        "measure_budget_warnings": measure_budget_issues[:10],
+    }
+
+
+def measure_last_activity(measure: dict[str, Any]) -> datetime | None:
+    stamps = []
+    for entry in measure.get("progress_history", []) + measure.get("comments", []):
+        stamp = _to_datetime(entry.get("created_at"))
+        if stamp:
+            stamps.append(stamp)
+    return max(stamps) if stamps else None
+
+
+def collect_insight_context(question: str, stale_days: int = 7) -> dict[str, Any]:
+    refresh_all_project_health()
+    now = datetime.utcnow()
+    projects = [clean_id(doc) for doc in db.projects.find().sort("health_score", 1)]
+
+    at_risk = []
+    stale_items = []
+    overdue_items = []
+    owner_gaps: dict[str, dict[str, Any]] = {}
+    bottleneck_counts: dict[str, int] = {}
+
+    for project in projects:
+        if project.get("status") in {"At Risk", "Off Track"}:
+            at_risk.append({
+                "name": project.get("name"),
+                "ministry": project.get("ministry"),
+                "owner": project.get("owner"),
+                "status": project.get("status"),
+                "health_score": project.get("health_score"),
+                "priority": project.get("priority", 5),
+                "top_bottleneck": (project.get("bottlenecks") or [None])[0],
+                "due_date": project.get("due_date"),
+                "budget_crore": project.get("budget_crore"),
+                "spent_crore": project.get("spent_crore"),
+            })
+        for name in project.get("bottlenecks", []):
+            bottleneck_counts[name] = bottleneck_counts.get(name, 0) + 1
+        for wig in project.get("wigs", []):
+            if wig.get("archived_at"):
+                continue
+            if entity_is_overdue(wig, complete_fn=wig_is_complete):
+                overdue_items.append({
+                    "type": "wig",
+                    "title": wig.get("title"),
+                    "project": project.get("name"),
+                    "ministry": project.get("ministry"),
+                    "owner": wig.get("owner") or project.get("owner"),
+                    "deadline": wig.get("deadline"),
+                    "days_overdue": days_past_deadline(wig.get("deadline")),
+                })
+            threshold = frequency_stale_days(wig.get("update_frequency", "weekly"))
+            for measure in wig.get("lead_measures", []):
+                if measure.get("archived_at"):
+                    continue
+                if entity_is_overdue(measure, complete_fn=measure_is_complete):
+                    overdue_items.append({
+                        "type": "lead_measure",
+                        "title": measure.get("title"),
+                        "wig": wig.get("title"),
+                        "project": project.get("name"),
+                        "ministry": project.get("ministry"),
+                        "owners": measure.get("assigned_to") or [wig.get("owner") or project.get("owner") or "Unassigned"],
+                        "deadline": measure.get("deadline"),
+                        "days_overdue": days_past_deadline(measure.get("deadline")),
+                        "health_state": measure_health_state(measure),
+                    })
+                last = measure_last_activity(measure)
+                days_stale = (now - last).days if last else None
+                if last is None or (days_stale is not None and days_stale >= threshold):
+                    owners = measure.get("assigned_to") or [wig.get("owner") or project.get("owner") or "Unassigned"]
+                    item = {
+                        "measure": measure.get("title"),
+                        "wig": wig.get("title"),
+                        "project": project.get("name"),
+                        "ministry": project.get("ministry"),
+                        "owners": owners,
+                        "days_stale": days_stale,
+                        "stale_threshold_days": threshold,
+                        "update_frequency": wig.get("update_frequency", "weekly"),
+                        "deadline": measure.get("deadline"),
+                        "priority": measure.get("priority", 5),
+                    }
+                    stale_items.append(item)
+                    for owner in owners:
+                        gap = owner_gaps.setdefault(owner, {"owner": owner, "count": 0, "items": [], "ministries": set()})
+                        gap["count"] += 1
+                        if len(gap["items"]) < 5:
+                            gap["items"].append({
+                                "measure": measure.get("title"),
+                                "project": project.get("name"),
+                                "days_stale": days_stale,
+                                "update_frequency": wig.get("update_frequency", "weekly"),
+                            })
+                        gap["ministries"].add(project.get("ministry") or "")
+
+    stale_owners = sorted(owner_gaps.values(), key=lambda gap: -gap["count"])
+    for gap in stale_owners:
+        gap["ministries"] = sorted(m for m in gap["ministries"] if m)
+
+    pending_approvals = db.approvals.count_documents({"status": "Pending"})
+    open_alerts = db.notifications.count_documents({"status": "Open"})
+    entity_matches = semantic_search_entities(question, limit=8).get("results", [])
+    document_matches = vector_search_documents(question, limit=6).get("results", [])
+    budget_context = collect_budget_context(projects)
+
+    return {
+        "generated_at": now.isoformat(),
+        "stale_days": stale_days,
+        "portfolio": {
+            "projects_total": len(projects),
+            "at_risk_count": len(at_risk),
+            "pending_approvals": pending_approvals,
+            "open_alerts": open_alerts,
+            "average_health": round(sum(p.get("health_score", 0) for p in projects) / len(projects)) if projects else 0,
+        },
+        "budget": budget_context,
+        "at_risk_projects": sorted(at_risk, key=lambda p: (p.get("health_score", 0), -(p.get("priority") or 5)))[:10],
+        "stale_measures": sorted(stale_items, key=lambda i: -(i["days_stale"] if i["days_stale"] is not None else 9999))[:25],
+        "overdue_items": sorted(overdue_items, key=lambda i: -(i.get("days_overdue") or 0))[:25],
+        "stale_owners": stale_owners[:12],
+        "top_bottlenecks": sorted(bottleneck_counts.items(), key=lambda kv: -kv[1])[:6],
+        "vector_matches": [{
+            "type": item.get("entity_type") or item.get("document_type"),
+            "title": item.get("title"),
+            "project_name": item.get("project_name"),
+            "state": item.get("state"),
+            "score": item.get("score"),
+            "text": (item.get("text") or item.get("content", ""))[:240],
+        } for item in (entity_matches[:5] + document_matches[:4])],
+    }
+
+
+def local_portfolio_insight(context: dict[str, Any], question: str) -> dict[str, Any]:
+    portfolio = context["portfolio"]
+    budget = context.get("budget", {})
+    at_risk = context["at_risk_projects"]
+    stale_owners = context["stale_owners"]
+    bottlenecks = context["top_bottlenecks"]
+    findings = []
+    if at_risk:
+        worst = at_risk[0]
+        findings.append({
+            "title": f"{len(at_risk)} of {portfolio['projects_total']} projects are at risk or off track",
+            "detail": f"Weakest is {worst['name']} ({worst['ministry']}) at {worst['health_score']}% health; top bottleneck: {worst.get('top_bottleneck') or 'not recorded'}.",
+            "severity": "High",
+            "projects": [p["name"] for p in at_risk[:5]],
+        })
+    if stale_owners:
+        top = stale_owners[0]
+        sample = top["items"][0] if top.get("items") else {}
+        freq = sample.get("update_frequency", "weekly")
+        findings.append({
+            "title": f"{len(context['stale_measures'])} lead measures missed their WIG update cadence",
+            "detail": f"Largest gap: {top['owner']} with {top['count']} silent measures ({', '.join(item['project'] for item in top['items'][:3])}). Cadence example: {freq}.",
+            "severity": "High",
+            "projects": sorted({item["project"] for item in context["stale_measures"][:8]}),
+        })
+    overdue_items = context.get("overdue_items", [])
+    if overdue_items:
+        top = overdue_items[0]
+        findings.append({
+            "title": f"{len(overdue_items)} WIGs or lead measures are past deadline",
+            "detail": f"Most urgent: {top.get('title')} in {top.get('project')} ({top.get('days_overdue')} days overdue, {top.get('type', 'item').replace('_', ' ')}).",
+            "severity": "Critical",
+            "projects": sorted({item["project"] for item in overdue_items[:8]}),
+        })
+    if budget.get("over_spent_projects"):
+        top = budget["over_spent_projects"][0]
+        findings.append({
+            "title": f"{len(budget['over_spent_projects'])} projects are over spent vs budget",
+            "detail": f"{top['project']} spent ₹{top['spent_crore']} Cr against ₹{top['budget_crore']} Cr (+₹{top['variance_crore']} Cr).",
+            "severity": "Critical",
+            "projects": [item["project"] for item in budget["over_spent_projects"][:5]],
+        })
+    if budget.get("over_allocated_projects"):
+        top = budget["over_allocated_projects"][0]
+        findings.append({
+            "title": f"{len(budget['over_allocated_projects'])} projects have WIG budgets exceeding project total",
+            "detail": f"{top['project']} allocated ₹{top['wig_allocated_crore']} Cr across WIGs vs ₹{top['budget_crore']} Cr project budget (+₹{top['variance_crore']} Cr).",
+            "severity": "High",
+            "projects": [item["project"] for item in budget["over_allocated_projects"][:5]],
+        })
+    if budget.get("wig_measure_overruns"):
+        top = budget["wig_measure_overruns"][0]
+        findings.append({
+            "title": "Lead measure budgets exceed their WIG allocations",
+            "detail": f"{top['project']} / {top['wig']}: measures total ₹{top['measure_allocated_crore']} Cr vs WIG ₹{top['wig_budget_crore']} Cr.",
+            "severity": "Medium",
+            "projects": sorted({item["project"] for item in budget["wig_measure_overruns"][:5]}),
+        })
+    if bottlenecks:
+        findings.append({
+            "title": "Recurring bottlenecks across the portfolio",
+            "detail": "; ".join(f"{name} ({count} projects)" for name, count in bottlenecks[:3]),
+            "severity": "Medium",
+            "projects": [],
+        })
+    if portfolio["pending_approvals"]:
+        findings.append({
+            "title": f"{portfolio['pending_approvals']} approvals are pending",
+            "detail": "Unblocked approvals are the fastest lever to restore delivery velocity.",
+            "severity": "Medium",
+            "projects": [],
+        })
+    actions = []
+    if at_risk:
+        actions.append({"owner": at_risk[0].get("owner") or "Project Director", "action": f"Run a 48-hour recovery review on {at_risk[0]['name']}.", "deadline": "Next 48 hours"})
+    if stale_owners:
+        actions.append({"owner": stale_owners[0]["owner"], "action": "Post progress updates on all silent lead measures before the next WIG session.", "deadline": "This week"})
+    actions.append({"owner": "PMU Lead", "action": "Review pending approvals and recurring bottlenecks in the weekly cadence.", "deadline": "Next WIG session"})
+    return {
+        "mode": "local_insight_engine",
+        "headline": f"Portfolio health {portfolio['average_health']}% — {len(at_risk)} projects need executive attention",
+        "summary": (
+            f"Across {portfolio['projects_total']} projects, average health is {portfolio['average_health']}%. "
+            f"{len(at_risk)} are at risk or off track, {len(context['stale_measures'])} lead measures missed their WIG cadence, "
+            f"{portfolio['pending_approvals']} approvals are pending, and portfolio spend is ₹{budget.get('portfolio_spent_crore', 0)} Cr "
+            f"against ₹{budget.get('portfolio_budget_crore', 0)} Cr budget."
+        ),
+        "findings": findings,
+        "actions": actions,
+        "citations": [p["name"] for p in at_risk[:5]] or sorted({item["project"] for item in context["stale_measures"][:5]}),
+    }
+
+
+def openai_portfolio_insight(context: dict[str, Any], question: str) -> dict[str, Any]:
+    system = (
+        "You are the chief delivery advisor to a head of government reviewing a 4DX execution portfolio. "
+        "Answer the executive's question directly using the supplied portfolio data: project health, at-risk projects, "
+        "stale lead measures grouped by owner (respecting each WIG's update_frequency cadence), overdue WIGs and lead measures past deadline, budget allocation vs spend, "
+        "over-allocated WIGs/measures, bottlenecks, approvals, and vector-search matches. "
+        "Name specific projects, owners, and numbers. No generic advice. Return only valid JSON."
+    )
+    schema_hint = {
+        "headline": "one direct sentence answering the question",
+        "summary": "3-4 sentence executive answer with concrete numbers and names",
+        "findings": [{"title": "finding", "detail": "specifics with names/numbers", "severity": "Low|Medium|High|Critical", "projects": ["project names"]}],
+        "actions": [{"owner": "person or role", "action": "specific action", "deadline": "timeframe"}],
+        "citations": ["project names referenced"],
+    }
+    prompt = {"question": question, "required_json_shape": schema_hint, "portfolio_context": context}
+    llm = call_llm_json(system, json.dumps(prompt, default=str), validate=portfolio_insight_payload_valid)
+    if llm["data"]:
+        data = llm["data"]
+        data["mode"] = f"{llm['provider']}_llm"
+        data["model"] = llm["model"]
+        data["llm_status"] = sanitize_llm_status(llm["llm_status"])
+        for key in ("findings", "actions", "citations"):
+            if not isinstance(data.get(key), list):
+                data[key] = []
+        data.setdefault("headline", "Portfolio insight generated.")
+        data.setdefault("summary", "")
+        return data
+    insight = local_portfolio_insight(context, question)
+    insight["llm_status"] = sanitize_llm_status(llm.get("llm_status"))
+    return insight
+
+
+def _normalize_risk_severity(value: str | None) -> str:
+    normalized = (value or "medium").strip().lower()
+    if normalized in {"critical", "high"}:
+        return "high"
+    if normalized == "low":
+        return "low"
+    return "medium"
+
+
+def _insight_query_for_scope(project: dict[str, Any], wig: dict[str, Any] | None = None, measure: dict[str, Any] | None = None) -> str:
+    parts = [project.get("name", "")]
+    if measure and wig:
+        parts.extend([wig.get("title", ""), measure.get("title", "")])
+    elif wig:
+        parts.append(wig.get("title", ""))
+    return " ".join(part for part in parts if part).strip() or "execution risks and blockers"
+
+
+def _project_budget_slice(project: dict[str, Any], wigs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    active = wigs if wigs is not None else active_wigs(project)
+    wig_allocated = sum(float(w.get("budget_allocated") or 0) for w in active)
+    project_budget = float(project.get("budget_crore") or 0)
+    spent = float(project.get("spent_crore") or 0)
+    return {
+        "budget_crore": project_budget,
+        "spent_crore": spent,
+        "wig_allocated_crore": round(wig_allocated, 1),
+        "over_spent": project_budget > 0 and spent > project_budget,
+        "over_allocated": project_budget > 0 and wig_allocated > project_budget,
+        "variance_spent_crore": round(spent - project_budget, 1) if project_budget else None,
+        "variance_allocated_crore": round(wig_allocated - project_budget, 1) if project_budget else None,
+    }
+
+
+def _measure_timeline_events(measure: dict[str, Any], wig_title: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for comment in measure.get("comments", []):
+        events.append({
+            "type": "comment",
+            "entity_id": comment.get("id"),
+            "measure_id": measure.get("id"),
+            "measure": measure.get("title"),
+            "wig": wig_title,
+            "text": (comment.get("comment") or "")[:500],
+            "health_state": comment.get("health_state"),
+            "author": comment.get("author"),
+            "created_at": comment.get("created_at"),
+        })
+    for entry in measure.get("progress_history", []):
+        events.append({
+            "type": "progress",
+            "entity_id": entry.get("id"),
+            "measure_id": measure.get("id"),
+            "measure": measure.get("title"),
+            "wig": wig_title,
+            "current_value": entry.get("current_value"),
+            "note": (entry.get("note") or "")[:500],
+            "health_state": entry.get("health_state"),
+            "author": entry.get("author"),
+            "created_at": entry.get("created_at"),
+        })
+    events.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    return events[:20]
+
+
+def _scan_scope_execution_signals(
+    project: dict[str, Any],
+    *,
+    wig_filter: str | None = None,
+    measure_filter: str | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    now = datetime.utcnow()
+    overdue_items: list[dict[str, Any]] = []
+    stale_items: list[dict[str, Any]] = []
+    timeline: list[dict[str, Any]] = []
+
+    for wig in active_wigs(project):
+        if wig_filter and wig.get("id") != wig_filter:
+            continue
+        if not measure_filter and entity_is_overdue(wig, complete_fn=wig_is_complete):
+            overdue_items.append({
+                "type": "wig",
+                "wig_id": wig.get("id"),
+                "title": wig.get("title"),
+                "owner": wig.get("owner") or project.get("owner"),
+                "deadline": wig.get("deadline"),
+                "days_overdue": days_past_deadline(wig.get("deadline")),
+                "update_frequency": wig.get("update_frequency", "weekly"),
+            })
+        threshold = frequency_stale_days(wig.get("update_frequency", "weekly"))
+        for measure in active_measures(wig):
+            if measure_filter and measure.get("id") != measure_filter:
+                continue
+            timeline.extend(_measure_timeline_events(measure, wig.get("title", "")))
+            if entity_is_overdue(measure, complete_fn=measure_is_complete):
+                overdue_items.append({
+                    "type": "lead_measure",
+                    "wig_id": wig.get("id"),
+                    "measure_id": measure.get("id"),
+                    "title": measure.get("title"),
+                    "wig": wig.get("title"),
+                    "owners": measure.get("assigned_to") or [wig.get("owner") or project.get("owner") or "Unassigned"],
+                    "deadline": measure.get("deadline"),
+                    "days_overdue": days_past_deadline(measure.get("deadline")),
+                    "health_state": measure_health_state(measure),
+                    "priority": measure.get("priority", 5),
+                })
+            last = measure_last_activity(measure)
+            days_stale = (now - last).days if last else None
+            if last is None or (days_stale is not None and days_stale >= threshold):
+                stale_items.append({
+                    "wig_id": wig.get("id"),
+                    "measure_id": measure.get("id"),
+                    "measure": measure.get("title"),
+                    "wig": wig.get("title"),
+                    "owners": measure.get("assigned_to") or [wig.get("owner") or project.get("owner") or "Unassigned"],
+                    "days_stale": days_stale,
+                    "stale_threshold_days": threshold,
+                    "update_frequency": wig.get("update_frequency", "weekly"),
+                    "deadline": measure.get("deadline"),
+                    "priority": measure.get("priority", 5),
+                })
+
+    timeline.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    return (
+        sorted(overdue_items, key=lambda item: -(item.get("days_overdue") or 0)),
+        sorted(stale_items, key=lambda item: -(item["days_stale"] if item["days_stale"] is not None else 9999)),
+        timeline[:30],
+    )
+
+
+def _wig_measure_summaries(wigs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for wig in wigs:
+        measures = active_measures(wig)
+        rows.append({
+            "id": wig.get("id"),
+            "title": wig.get("title"),
+            "owner": wig.get("owner"),
+            "priority": wig.get("priority", 5),
+            "update_frequency": wig.get("update_frequency", "weekly"),
+            "deadline": wig.get("deadline"),
+            "budget_allocated": wig.get("budget_allocated"),
+            "progress_percent": progress_percent(
+                float(wig.get("from_value") or 0),
+                float(wig.get("to_value") or 0),
+                float(wig.get("current_value") if wig.get("current_value") is not None else wig.get("from_value") or 0),
+            ),
+            "overdue": entity_is_overdue(wig, complete_fn=wig_is_complete),
+            "measure_count": len(measures),
+            "measures": [{
+                "id": measure.get("id"),
+                "title": measure.get("title"),
+                "assigned_to": measure.get("assigned_to"),
+                "priority": measure.get("priority", 5),
+                "deadline": measure.get("deadline"),
+                "budget_allocated": measure.get("budget_allocated"),
+                "current_value": measure.get("current_value"),
+                "to_value": measure.get("to_value"),
+                "unit": measure.get("unit"),
+                "health_state": measure_health_state(measure),
+                "overdue": entity_is_overdue(measure, complete_fn=measure_is_complete),
+            } for measure in measures[:12]],
+        })
+    return rows
+
+
+def _filter_collection(items: list[dict[str, Any]], wig_id: str | None, measure_id: str | None) -> list[dict[str, Any]]:
+    if measure_id:
+        return [item for item in items if item.get("measure_id") == measure_id]
+    if wig_id:
+        return [item for item in items if item.get("wig_id") == wig_id or (not item.get("wig_id") and not item.get("measure_id"))]
+    return items
+
+
+def collect_contextual_insight_context(
+    project_id: str,
+    wig_id: str | None = None,
+    measure_id: str | None = None,
+) -> dict[str, Any]:
+    project_oid = oid(project_id)
+    project = refresh_project_health(project_oid)
+    wig = find_wig(project, wig_id) if wig_id else None
+    if wig_id and not wig:
+        raise HTTPException(status_code=404, detail="WIG not found")
+    measure = find_measure(wig, measure_id) if wig and measure_id else None
+    if measure_id and not measure:
+        raise HTTPException(status_code=404, detail="Lead measure not found")
+
+    scope = "measure" if measure else "wig" if wig else "project"
+    ministry = db.ministries.find_one({"_id": project.get("ministry_id")}) or {}
+    scope_wigs = [wig] if wig else active_wigs(project)
+    overdue_items, stale_items, timeline = _scan_scope_execution_signals(
+        project,
+        wig_filter=wig.get("id") if wig else None,
+        measure_filter=measure.get("id") if measure else None,
+    )
+
+    pid = project["_id"]
+    documents = [clean_id(doc) for doc in db.documents.find({"project_id": pid}).sort("created_at", -1).limit(20)]
+    assignments = [clean_id(doc) for doc in db.assignments.find({"project_id": pid}).sort("due_date", 1).limit(15)]
+    decisions = [clean_id(doc) for doc in db.decisions.find({"project_id": pid}).sort("due_date", 1).limit(15)]
+    approvals = [clean_id(doc) for doc in db.approvals.find({"project_id": pid}).sort("created_at", -1).limit(15)]
+    notifications = [clean_id(doc) for doc in db.notifications.find({"project_id": pid, "status": "Open"}).sort("created_at", -1).limit(12)]
+    meetings = [clean_id(doc) for doc in db.weekly_meetings.find({"project_id": pid}).sort("meeting_date", -1).limit(8)]
+    audit_events = [clean_id(doc) for doc in db.audit_events.find({"project_id": pid}).sort("created_at", -1).limit(15)]
+    health_snapshots = [clean_id(doc) for doc in db.health_snapshots.find().sort("recorded_at", -1).limit(6)]
+
+    if wig_id:
+        documents = _filter_collection(documents, wig_id, measure_id)
+        approvals = _filter_collection(approvals, wig_id, measure_id)
+
+    search_query = _insight_query_for_scope(project, wig, measure)
+    entity_matches = semantic_search_entities(search_query, limit=10).get("results", [])
+    entity_matches = [item for item in entity_matches if str(item.get("project_id")) == str(project["_id"])][:6]
+    document_matches = vector_search_documents(search_query, limit=6, project_id=str(project["_id"])).get("results", [])
+    if wig_id:
+        document_matches = [doc for doc in document_matches if not doc.get("wig_id") or doc.get("wig_id") == wig_id]
+    if measure_id:
+        document_matches = [doc for doc in document_matches if doc.get("measure_id") == measure_id]
+
+    budget = _project_budget_slice(project, scope_wigs)
+    if wig:
+        wig_budget = float(wig.get("budget_allocated") or 0)
+        measure_allocated = sum(float(m.get("budget_allocated") or 0) for m in active_measures(wig))
+        budget["wig_budget_crore"] = wig_budget
+        budget["measure_allocated_crore"] = round(measure_allocated, 1)
+        budget["wig_over_allocated"] = wig_budget > 0 and measure_allocated > wig_budget
+    if measure:
+        budget["measure_budget_crore"] = float(measure.get("budget_allocated") or 0)
+
+    entity_label = measure.get("title") if measure else wig.get("title") if wig else project.get("name")
+    return {
+        "scope": scope,
+        "generated_at": datetime.utcnow().isoformat(),
+        "entity": {
+            "type": scope,
+            "title": entity_label,
+            "project_id": str(project["_id"]),
+            "project_name": project.get("name"),
+            "wig_id": wig.get("id") if wig else None,
+            "wig_title": wig.get("title") if wig else None,
+            "measure_id": measure.get("id") if measure else None,
+            "measure_title": measure.get("title") if measure else None,
+        },
+        "project": {
+            "name": project.get("name"),
+            "ministry": project.get("ministry") or ministry.get("name"),
+            "owner": project.get("owner"),
+            "status": project.get("status"),
+            "health_score": project.get("health_score"),
+            "health_state": project.get("health_state"),
+            "priority": project.get("priority", 5),
+            "phase": project.get("phase"),
+            "due_date": project.get("due_date"),
+            "current_state": project.get("current_state"),
+            "target_state": project.get("target_state"),
+            "kpis": project.get("kpis"),
+            "bottlenecks": project.get("bottlenecks", [])[:6],
+        },
+        "ministry": clean_id(ministry) if ministry else {},
+        "focus": clean_id(measure or wig or {
+            "title": project.get("name"),
+            "owner": project.get("owner"),
+            "due_date": project.get("due_date"),
+            "priority": project.get("priority", 5),
+        }),
+        "wigs": _wig_measure_summaries(scope_wigs if scope != "project" else active_wigs(project)),
+        "budget": budget,
+        "overdue_items": overdue_items[:12],
+        "stale_measures": stale_items[:12],
+        "timeline": timeline,
+        "documents": [{
+            "_id": str(doc.get("_id")) if doc.get("_id") else None,
+            "title": doc.get("title"),
+            "document_type": doc.get("document_type"),
+            "risk_score": doc.get("risk_score"),
+            "risk_signals": doc.get("risk_signals"),
+            "ai_summary": doc.get("ai_summary"),
+            "content": (doc.get("content") or "")[:400],
+            "wig_id": doc.get("wig_id"),
+            "measure_id": doc.get("measure_id"),
+        } for doc in documents[:10]],
+        "assignments": assignments[:10],
+        "decisions": [item for item in decisions if item.get("status") == "Pending"][:8] or decisions[:8],
+        "approvals": [item for item in approvals if item.get("status") == "Pending"][:8] or approvals[:8],
+        "notifications": notifications[:8],
+        "meetings": meetings[:6],
+        "audit_events": audit_events[:8],
+        "health_snapshots": health_snapshots,
+        "vector_matches": [{
+            "type": item.get("entity_type") or item.get("document_type"),
+            "title": item.get("title"),
+            "state": item.get("state"),
+            "score": item.get("score"),
+            "text": (item.get("text") or item.get("content") or "")[:240],
+        } for item in (entity_matches + document_matches)[:8]],
+        "counts": {
+            "pending_approvals": len([item for item in approvals if item.get("status") == "Pending"]),
+            "open_notifications": len(notifications),
+            "open_assignments": len([item for item in assignments if item.get("status") not in {"Done", "Completed"}]),
+            "pending_decisions": len([item for item in decisions if item.get("status") == "Pending"]),
+        },
+    }
+
+
+def _insight_source(
+    source_type: str,
+    *,
+    project_id: str,
+    label: str,
+    wig_id: str | None = None,
+    measure_id: str | None = None,
+    entity_id: str | None = None,
+    tab: str | None = None,
+) -> dict[str, Any]:
+    path = f"/projects/{project_id}"
+    if wig_id:
+        path += f"/wigs/{wig_id}"
+    if measure_id:
+        path += f"/measures/{measure_id}"
+    if tab:
+        path += ("&" if "?" in path else "?") + f"tab={tab}"
+    return {
+        "type": source_type,
+        "project_id": project_id,
+        "wig_id": wig_id,
+        "measure_id": measure_id,
+        "entity_id": entity_id,
+        "label": label,
+        "url_path": path,
+        "tab": tab,
+    }
+
+
+def _lookup_wig_measure_ids(
+    context: dict[str, Any],
+    *,
+    wig_title: str | None = None,
+    measure_title: str | None = None,
+) -> tuple[str | None, str | None]:
+    for wig in context.get("wigs") or []:
+        if wig_title and (wig.get("title") or "").strip() != (wig_title or "").strip():
+            continue
+        if measure_title:
+            for measure in wig.get("measures") or []:
+                if (measure.get("title") or "").strip() == (measure_title or "").strip():
+                    return wig.get("id"), measure.get("id")
+            continue
+        return wig.get("id"), None
+    entity = context.get("entity") or {}
+    if not wig_title and not measure_title:
+        return entity.get("wig_id"), entity.get("measure_id")
+    return None, None
+
+
+def _normalize_risk_source(risk: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    """Ensure each risk has a navigable source object."""
+    project_id = str((context.get("entity") or {}).get("project_id") or "")
+    entity = context.get("entity") or {}
+    raw = risk.get("source")
+    if isinstance(raw, dict) and raw.get("type") and raw.get("project_id"):
+        label = raw.get("label") or raw.get("type")
+        return _insight_source(
+            raw["type"],
+            project_id=str(raw.get("project_id") or project_id),
+            label=label,
+            wig_id=raw.get("wig_id"),
+            measure_id=raw.get("measure_id"),
+            entity_id=raw.get("entity_id"),
+            tab=raw.get("tab"),
+        )
+
+    label = raw if isinstance(raw, str) else "Analysis"
+    title = (risk.get("title") or "").lower()
+    reason = (risk.get("reason") or "").lower()
+
+    if entity.get("measure_id") and (
+        "lead measure" in title
+        or "timeline" in title
+        or "activity" in title
+        or "cadence" in label.lower()
+        or context.get("scope") == "measure"
+    ):
+        if "timeline" in title or "activity" in title or "cadence" in label.lower():
+            return _insight_source(
+                "timeline",
+                project_id=project_id,
+                wig_id=entity.get("wig_id"),
+                measure_id=entity.get("measure_id"),
+                label=entity.get("measure_title") or "Lead measure activity",
+                tab="activity",
+            )
+        return _insight_source(
+            "measure",
+            project_id=project_id,
+            wig_id=entity.get("wig_id"),
+            measure_id=entity.get("measure_id"),
+            label=entity.get("measure_title") or "Lead measure",
+            tab="activity",
+        )
+
+    if entity.get("wig_id") and context.get("scope") == "wig":
+        return _insight_source(
+            "wig",
+            project_id=project_id,
+            wig_id=entity.get("wig_id"),
+            label=entity.get("wig_title") or "WIG",
+        )
+
+    for item in context.get("overdue_items") or []:
+        if item.get("measure_id") and (item.get("title") or "").lower() in title + reason:
+            return _insight_source(
+                "measure",
+                project_id=project_id,
+                wig_id=item.get("wig_id"),
+                measure_id=item.get("measure_id"),
+                label=item.get("title") or "Overdue measure",
+                tab="activity",
+            )
+        if item.get("wig_id") and not item.get("measure_id"):
+            if (item.get("title") or "").lower() in title + reason or "deadline" in title:
+                return _insight_source(
+                    "wig",
+                    project_id=project_id,
+                    wig_id=item.get("wig_id"),
+                    label=item.get("title") or "Overdue WIG",
+                )
+
+    if context.get("overdue_items"):
+        top = context["overdue_items"][0]
+        if top.get("measure_id"):
+            return _insight_source(
+                "measure",
+                project_id=project_id,
+                wig_id=top.get("wig_id"),
+                measure_id=top.get("measure_id"),
+                label=top.get("title") or "Overdue item",
+                tab="activity",
+            )
+        if top.get("wig_id"):
+            return _insight_source(
+                "wig",
+                project_id=project_id,
+                wig_id=top.get("wig_id"),
+                label=top.get("title") or "Overdue WIG",
+            )
+
+    for item in context.get("stale_measures") or []:
+        if item.get("measure_id"):
+            return _insight_source(
+                "measure",
+                project_id=project_id,
+                wig_id=item.get("wig_id"),
+                measure_id=item.get("measure_id"),
+                label=item.get("measure") or "Stale lead measure",
+                tab="activity",
+            )
+
+    pending_approvals = [a for a in context.get("approvals") or [] if a.get("status") == "Pending"]
+    if pending_approvals and ("approval" in title or "approval" in label.lower()):
+        item = pending_approvals[0]
+        return _insight_source(
+            "approval",
+            project_id=project_id,
+            wig_id=item.get("wig_id"),
+            measure_id=item.get("measure_id"),
+            entity_id=str(item.get("_id") or item.get("id") or ""),
+            label=item.get("title") or "Pending approval",
+            tab="approvals" if item.get("measure_id") else None,
+        )
+
+    pending_decisions = [d for d in context.get("decisions") or [] if d.get("status") == "Pending"]
+    if pending_decisions and ("decision" in title or "decision" in label.lower()):
+        item = pending_decisions[0]
+        return _insight_source(
+            "decision",
+            project_id=project_id,
+            entity_id=str(item.get("_id") or item.get("id") or ""),
+            label=item.get("title") or "Pending decision",
+        )
+
+    high_risk_docs = [doc for doc in context.get("documents") or [] if (doc.get("risk_score") or 0) >= 0.55]
+    if high_risk_docs and ("evidence" in title or "document" in label.lower()):
+        doc = high_risk_docs[0]
+        return _insight_source(
+            "document",
+            project_id=project_id,
+            wig_id=doc.get("wig_id"),
+            measure_id=doc.get("measure_id"),
+            entity_id=doc.get("_id"),
+            label=doc.get("title") or "Evidence document",
+            tab="evidence" if doc.get("measure_id") else None,
+        )
+
+    open_assignments = [a for a in context.get("assignments") or [] if a.get("status") not in {"Done", "Completed"}]
+    if open_assignments and "assignment" in label.lower():
+        item = open_assignments[0]
+        return _insight_source(
+            "assignment",
+            project_id=project_id,
+            entity_id=str(item.get("_id") or item.get("id") or ""),
+            label=item.get("title") or "Open assignment",
+        )
+
+    bottlenecks = (context.get("project") or {}).get("bottlenecks") or []
+    if bottlenecks and ("bottleneck" in title or "at risk" in title or "off track" in title):
+        wig_id, measure_id = _lookup_wig_measure_ids(context)
+        return _insight_source(
+            "bottleneck",
+            project_id=project_id,
+            wig_id=wig_id,
+            measure_id=measure_id,
+            label=bottlenecks[0],
+        )
+
+    wig_id, measure_id = _lookup_wig_measure_ids(context)
+    return _insight_source(
+        "bottleneck" if bottlenecks else "timeline",
+        project_id=project_id,
+        wig_id=wig_id or entity.get("wig_id"),
+        measure_id=measure_id or entity.get("measure_id"),
+        label=label if isinstance(label, str) else "Project overview",
+        tab="activity" if measure_id else None,
+    )
+
+
+def local_contextual_insight(context: dict[str, Any]) -> dict[str, Any]:
+    scope = context["scope"]
+    entity = context["entity"]
+    project = context["project"]
+    budget = context.get("budget", {})
+    risks: list[dict[str, Any]] = []
+    highlights: list[dict[str, Any]] = []
+    project_id = str(entity.get("project_id") or "")
+
+    label = entity.get("title") or project.get("name")
+    focus = context.get("focus") or {}
+
+    if scope in {"wig", "measure"} and focus:
+        progress = progress_percent(
+            float(focus.get("from_value") or 0),
+            float(focus.get("to_value") or 0),
+            float(focus.get("current_value") if focus.get("current_value") is not None else focus.get("from_value") or 0),
+        )
+        unit = focus.get("unit") or ""
+        if scope == "measure":
+            owners = ", ".join(focus.get("assigned_to") or []) or "Unassigned"
+            if entity_is_overdue(focus, complete_fn=measure_is_complete):
+                risks.append({
+                    "title": "Lead measure past deadline",
+                    "severity": "high",
+                    "reason": f"{label} is overdue (due {focus.get('deadline')}). Assigned to {owners}. Progress {progress}%{f' {unit}' if unit else ''}.",
+                    "source": _insight_source(
+                        "measure",
+                        project_id=project_id,
+                        wig_id=entity.get("wig_id"),
+                        measure_id=entity.get("measure_id"),
+                        label=label,
+                        tab="activity",
+                    ),
+                })
+            elif progress < 40 and project.get("status") in {"At Risk", "Off Track"}:
+                risks.append({
+                    "title": "Lead measure lagging on at-risk project",
+                    "severity": "high",
+                    "reason": f"{label} at {progress}% while project is {project.get('status')} (health {project.get('health_score')}%).",
+                    "source": _insight_source(
+                        "measure",
+                        project_id=project_id,
+                        wig_id=entity.get("wig_id"),
+                        measure_id=entity.get("measure_id"),
+                        label=label,
+                        tab="activity",
+                    ),
+                })
+            if not context.get("timeline"):
+                risks.append({
+                    "title": "No recent timeline activity",
+                    "severity": "medium",
+                    "reason": f"No progress updates or comments recorded recently for {label}.",
+                    "source": _insight_source(
+                        "timeline",
+                        project_id=project_id,
+                        wig_id=entity.get("wig_id"),
+                        measure_id=entity.get("measure_id"),
+                        label=f"{label} activity",
+                        tab="activity",
+                    ),
+                })
+        if scope == "wig":
+            if entity_is_overdue(focus, complete_fn=wig_is_complete):
+                risks.append({
+                    "title": "WIG past deadline",
+                    "severity": "high",
+                    "reason": f"{label} is overdue (due {focus.get('deadline')}). Progress {progress}%.",
+                    "source": _insight_source(
+                        "wig",
+                        project_id=project_id,
+                        wig_id=entity.get("wig_id"),
+                        label=label,
+                    ),
+                })
+            elif progress < 50:
+                risks.append({
+                    "title": "WIG progress behind pace",
+                    "severity": "medium",
+                    "reason": f"{label} at {progress}% with owner {focus.get('owner') or 'Unassigned'}.",
+                    "source": _insight_source(
+                        "wig",
+                        project_id=project_id,
+                        wig_id=entity.get("wig_id"),
+                        label=label,
+                    ),
+                })
+
+    if project.get("status") in {"At Risk", "Off Track"} and scope == "project":
+        bottleneck = (project.get("bottlenecks") or ["Project health"])[0]
+        wig_id, measure_id = _lookup_wig_measure_ids(context)
+        risks.append({
+            "title": f"{project['name']} is {project['status'].lower()}",
+            "severity": "high",
+            "reason": f"Health score {project.get('health_score')}% with bottlenecks: {', '.join(project.get('bottlenecks') or []) or 'not recorded'}.",
+            "source": _insight_source(
+                "bottleneck",
+                project_id=project_id,
+                wig_id=wig_id,
+                measure_id=measure_id,
+                label=bottleneck,
+            ),
+        })
+    if context.get("overdue_items"):
+        top = context["overdue_items"][0]
+        src_type = "measure" if top.get("measure_id") else "wig"
+        risks.append({
+            "title": f"{len(context['overdue_items'])} items past deadline",
+            "severity": "high",
+            "reason": f"Most urgent: {top.get('title')} ({top.get('days_overdue')} days overdue).",
+            "source": _insight_source(
+                src_type,
+                project_id=project_id,
+                wig_id=top.get("wig_id"),
+                measure_id=top.get("measure_id"),
+                label=top.get("title") or "Overdue item",
+                tab="activity" if top.get("measure_id") else None,
+            ),
+        })
+    if context.get("stale_measures"):
+        top = context["stale_measures"][0]
+        owners = ", ".join(top.get("owners") or [])
+        risks.append({
+            "title": f"{len(context['stale_measures'])} lead measures missed update cadence",
+            "severity": "high",
+            "reason": f"{top.get('measure')} on {top.get('wig')} — owners {owners} silent for {top.get('days_stale') or 'unknown'} days (cadence: {top.get('update_frequency')}).",
+            "source": _insight_source(
+                "measure",
+                project_id=project_id,
+                wig_id=top.get("wig_id"),
+                measure_id=top.get("measure_id"),
+                label=top.get("measure") or "Stale lead measure",
+                tab="activity",
+            ),
+        })
+    if budget.get("over_spent"):
+        risks.append({
+            "title": "Spending exceeds project budget",
+            "severity": "high",
+            "reason": f"Spent ₹{budget.get('spent_crore')} Cr vs ₹{budget.get('budget_crore')} Cr budget.",
+            "source": _insight_source("bottleneck", project_id=project_id, label="Budget"),
+        })
+    if budget.get("over_allocated") or budget.get("wig_over_allocated"):
+        wig_id, _ = _lookup_wig_measure_ids(context)
+        risks.append({
+            "title": "Budget over-allocated to WIGs or measures",
+            "severity": "medium",
+            "reason": "Allocated sub-budgets exceed their parent envelope.",
+            "source": _insight_source("bottleneck", project_id=project_id, wig_id=wig_id, label="Budget allocation"),
+        })
+    pending = context.get("counts", {})
+    pending_approvals = [a for a in context.get("approvals") or [] if a.get("status") == "Pending"]
+    if pending.get("pending_approvals") and pending_approvals:
+        item = pending_approvals[0]
+        risks.append({
+            "title": f"{pending['pending_approvals']} approvals pending",
+            "severity": "medium",
+            "reason": "Unblocked approvals may be delaying execution.",
+            "source": _insight_source(
+                "approval",
+                project_id=project_id,
+                wig_id=item.get("wig_id"),
+                measure_id=item.get("measure_id"),
+                entity_id=str(item.get("_id") or ""),
+                label=item.get("title") or "Pending approval",
+                tab="approvals" if item.get("measure_id") else None,
+            ),
+        })
+    pending_decisions = [d for d in context.get("decisions") or [] if d.get("status") == "Pending"]
+    if pending.get("pending_decisions") and pending_decisions:
+        item = pending_decisions[0]
+        risks.append({
+            "title": f"{pending['pending_decisions']} decisions awaiting resolution",
+            "severity": "medium",
+            "reason": "Executive decisions are queued and may block progress.",
+            "source": _insight_source(
+                "decision",
+                project_id=project_id,
+                entity_id=str(item.get("_id") or ""),
+                label=item.get("title") or "Pending decision",
+            ),
+        })
+    high_risk_docs = [doc for doc in context.get("documents", []) if (doc.get("risk_score") or 0) >= 0.55]
+    if high_risk_docs:
+        doc = high_risk_docs[0]
+        risks.append({
+            "title": "Evidence signals elevated risk",
+            "severity": "medium",
+            "reason": f"{doc.get('title')}: {(doc.get('ai_summary') or {}).get('headline') or doc.get('content', '')[:120]}",
+            "source": _insight_source(
+                "document",
+                project_id=project_id,
+                wig_id=doc.get("wig_id"),
+                measure_id=doc.get("measure_id"),
+                entity_id=doc.get("_id"),
+                label=doc.get("title") or "Evidence document",
+                tab="evidence" if doc.get("measure_id") else None,
+            ),
+        })
+
+    if project.get("health_score", 0) >= 75 and scope == "project":
+        highlights.append({"title": "Healthy execution posture", "detail": f"Portfolio health for this project is {project.get('health_score')}%."})
+    if not context.get("stale_measures") and context.get("wigs"):
+        highlights.append({"title": "Cadence discipline maintained", "detail": "All in-scope lead measures have recent updates."})
+    if context.get("meetings"):
+        highlights.append({"title": "WIG sessions logged", "detail": f"Latest session on {context['meetings'][0].get('meeting_date')}."})
+
+    summary_parts = [
+        f"{label} ({scope}) review at {context.get('generated_at', '')[:10]}.",
+        f"Project health {project.get('health_score')}% — status {project.get('status')}.",
+    ]
+    if scope != "project":
+        summary_parts.append(f"Scope limited to {'lead measure' if scope == 'measure' else 'WIG'} data across linked collections.")
+    if risks:
+        summary_parts.append(f"{len(risks)} risk signals identified from deadlines, cadence, budget, and workflow data.")
+    else:
+        summary_parts.append("No critical risk signals detected in the current data snapshot.")
+
+    return {
+        "summary": " ".join(summary_parts),
+        "risks": risks[:8],
+        "highlights": highlights[:5],
+        "llm_status": format_fallback_status(),
+    }
+
+
+def _compact_insight_context(context: dict[str, Any]) -> dict[str, Any]:
+    project = context.get("project") or {}
+    return {
+        "scope": context.get("scope"),
+        "entity": context.get("entity"),
+        "project": {k: project.get(k) for k in (
+            "name", "status", "health_score", "owner", "due_date", "bottlenecks", "phase", "priority",
+        )},
+        "focus": context.get("focus"),
+        "budget": context.get("budget"),
+        "overdue_items": (context.get("overdue_items") or [])[:8],
+        "stale_measures": (context.get("stale_measures") or [])[:8],
+        "timeline": (context.get("timeline") or [])[:10],
+        "counts": context.get("counts"),
+        "wigs": (context.get("wigs") or [])[:4],
+    }
+
+
+def _clean_risk_items(risks: list[Any], context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    for risk in risks or []:
+        if not isinstance(risk, dict):
+            continue
+        title = (risk.get("title") or "").strip()
+        reason = (risk.get("reason") or "").strip()
+        if not title and not reason:
+            continue
+        item = {
+            "title": title or "Risk signal",
+            "severity": _normalize_risk_severity(risk.get("severity")),
+            "reason": reason or title,
+        }
+        if context:
+            item["source"] = _normalize_risk_source({**item, "source": risk.get("source")}, context)
+        elif isinstance(risk.get("source"), dict):
+            item["source"] = risk.get("source")
+        else:
+            item["source"] = risk.get("source") or "Analysis"
+        cleaned.append(item)
+    return cleaned
+
+
+def ensure_insight_payload(
+    insight: dict[str, Any],
+    context: dict[str, Any],
+    *,
+    llm_status: str | None = None,
+) -> dict[str, Any]:
+    """Guarantee non-empty summary and risks using deterministic context builder."""
+    fallback = local_contextual_insight(context)
+    summary = (insight.get("summary") or "").strip()
+    risks = _clean_risk_items(insight.get("risks") or [], context)
+    highlights = [
+        item for item in (insight.get("highlights") or [])
+        if isinstance(item, dict) and (item.get("title") or "").strip()
+    ]
+
+    status = llm_status or insight.get("llm_status") or fallback["llm_status"]
+    enriched = False
+
+    if not summary:
+        summary = fallback["summary"]
+        enriched = True
+    if not risks:
+        risks = fallback["risks"]
+        enriched = True
+    if not highlights and fallback.get("highlights"):
+        highlights = fallback["highlights"]
+
+    if not risks and context.get("project"):
+        project = context["project"]
+        label = (context.get("entity") or {}).get("title") or project.get("name") or "Entity"
+        risks = _clean_risk_items([{
+            "title": f"{label} requires monitoring",
+            "severity": "medium",
+            "reason": (
+                f"Project health {project.get('health_score')}% with status {project.get('status')}. "
+                f"{len(context.get('timeline') or [])} timeline events in scope."
+            ),
+            "source": "Context",
+        }], context)
+        if not summary:
+            summary = fallback["summary"]
+        enriched = True
+
+    if enriched and status and not status.startswith("Local"):
+        status = sanitize_llm_status(status)
+
+    return {
+        "summary": summary,
+        "risks": _clean_risk_items(risks, context)[:8],
+        "highlights": highlights[:5],
+        "llm_status": sanitize_llm_status(status),
+    }
+
+
+def openai_contextual_insight(context: dict[str, Any]) -> dict[str, Any]:
+    scope = context["scope"]
+    entity = context["entity"]
+    focus_label = entity.get("title") or context["project"].get("name")
+    question = (
+        f"Summarize execution status for this {scope} and identify all material risks. "
+        f"Focus: {focus_label}. Use only supplied data."
+    )
+    system = (
+        "You are a 4DX delivery advisor reviewing a single project, WIG, or lead measure. "
+        "Use the supplied context only — project/WIG/measure fields, budget, overdue items, stale cadence updates, "
+        "comments/timeline, documents, approvals, decisions, assignments, notifications, meetings, audit events, and vector matches. "
+        "Return only valid JSON with summary, risks (title, severity as high|medium|low, reason, source), and highlights (title, detail)."
+    )
+    schema_hint = {
+        "summary": "3-5 sentence executive summary with concrete numbers and names",
+        "risks": [{"title": "risk", "severity": "high|medium|low", "reason": "specific evidence", "source": {"type": "measure|wig|approval|document|timeline|bottleneck", "label": "human label"}}],
+        "highlights": [{"title": "positive signal", "detail": "specific evidence"}],
+    }
+    compact = _compact_insight_context(context)
+    prompt = {"question": question, "required_json_shape": schema_hint, "context": compact}
+    llm = call_llm_json(system, json.dumps(prompt, default=str), validate=insight_payload_valid, feature="insight")
+
+    if llm.get("data"):
+        data = llm["data"]
+        draft = {
+            "summary": data.get("summary") or "",
+            "risks": data.get("risks") or [],
+            "highlights": data.get("highlights") or [],
+            "llm_status": llm["llm_status"],
+        }
+        return ensure_insight_payload(draft, context, llm_status=llm["llm_status"])
+
+    fallback = local_contextual_insight(context)
+    fallback["llm_status"] = sanitize_llm_status(llm.get("llm_status"))
+    return ensure_insight_payload(fallback, context, llm_status=fallback["llm_status"])
+
+
+def generate_contextual_insight(project_id: str, wig_id: str | None = None, measure_id: str | None = None) -> dict[str, Any]:
+    context = collect_contextual_insight_context(project_id, wig_id, measure_id)
+    insight = openai_contextual_insight(context)
+    return {
+        **insight,
+        "scope": context["scope"],
+        "entity": context["entity"],
+    }
+
+
+def local_contextual_insight_ask(question: str, context: dict[str, Any]) -> dict[str, Any]:
+    q = question.lower()
+    scope = context["scope"]
+    entity = context["entity"]
+    project = context["project"]
+    label = entity.get("title") or project.get("name")
+    parts: list[str] = []
+    insight = local_contextual_insight(context)
+    focus = context.get("focus") or {}
+
+    if any(word in q for word in ("health", "status", "track", "progress", "pace")):
+        parts.append(f"{label} sits on project {project.get('name')} with health {project.get('health_score')}% ({project.get('status')}).")
+        if scope in {"wig", "measure"} and focus:
+            progress = progress_percent(
+                float(focus.get("from_value") or 0),
+                float(focus.get("to_value") or 0),
+                float(focus.get("current_value") if focus.get("current_value") is not None else focus.get("from_value") or 0),
+            )
+            parts.append(f"In-scope progress is {progress}% toward {focus.get('target_state') or 'target'}.")
+
+    if any(word in q for word in ("risk", "overdue", "stale", "budget", "block", "concern", "issue")):
+        risks = insight.get("risks") or []
+        if risks:
+            for risk in risks[:3]:
+                parts.append(f"{risk.get('title')}: {risk.get('reason')}")
+        else:
+            parts.append("No critical risk signals are present in the current snapshot.")
+
+    if any(word in q for word in ("highlight", "positive", "working", "well", "win")):
+        for item in (insight.get("highlights") or [])[:3]:
+            detail = item.get("detail") or ""
+            parts.append(f"{item.get('title')}{(': ' + detail) if detail else ''}")
+
+    if any(word in q for word in ("owner", "assign", "who")):
+        if scope == "measure":
+            owners = ", ".join(focus.get("assigned_to") or []) or "Unassigned"
+            parts.append(f"{label} is assigned to {owners}.")
+        elif scope == "wig":
+            parts.append(f"{label} owner: {focus.get('owner') or 'Unassigned'}.")
+        else:
+            parts.append(f"Project owner: {project.get('owner') or 'Unassigned'}.")
+
+    if any(word in q for word in ("deadline", "due", "date", "when")):
+        due = focus.get("deadline") or project.get("due_date")
+        if due:
+            parts.append(f"Due date in scope: {due}.")
+        overdue = context.get("overdue_items") or []
+        if overdue:
+            top = overdue[0]
+            parts.append(f"Most urgent overdue item: {top.get('title')} ({top.get('days_overdue')} days).")
+
+    if not parts:
+        parts.append(insight.get("summary") or f"Insufficient data to answer '{question}' about {label}. Review the summary and risks above.")
+
+    return {
+        "answer": " ".join(parts)[:1200],
+        "llm_status": format_fallback_status(),
+        "scope": scope,
+        "entity": entity,
+    }
+
+
+def openai_contextual_insight_ask(question: str, context: dict[str, Any]) -> dict[str, Any]:
+    scope = context["scope"]
+    entity = context["entity"]
+    focus_label = entity.get("title") or context["project"].get("name")
+    system = (
+        "You are a 4DX delivery advisor answering follow-up questions about a single project, WIG, or lead measure. "
+        "Use only the supplied context — project/WIG/measure fields, budget, overdue items, stale cadence updates, "
+        "comments/timeline, documents, approvals, decisions, assignments, notifications, meetings, audit events, and vector matches. "
+        "Return only valid JSON with a concise answer (2-5 sentences) grounded in that data. "
+        "If the context cannot support an answer, say so briefly."
+    )
+    schema_hint = {"answer": "concise answer grounded in context"}
+    compact = _compact_insight_context(context)
+    prompt = {
+        "user_question": question,
+        "scope": scope,
+        "focus": focus_label,
+        "required_json_shape": schema_hint,
+        "context": compact,
+    }
+    llm = call_llm_json(
+        system,
+        json.dumps(prompt, default=str),
+        validate=insight_ask_payload_valid,
+        feature="insight",
+    )
+
+    if llm.get("data"):
+        answer = (llm["data"].get("answer") or "").strip()
+        if answer:
+            return {
+                "answer": answer,
+                "llm_status": sanitize_llm_status(llm["llm_status"]),
+                "scope": scope,
+                "entity": entity,
+            }
+
+    fallback = local_contextual_insight_ask(question, context)
+    fallback["llm_status"] = sanitize_llm_status(llm.get("llm_status"))
+    return fallback
+
+
+def generate_contextual_insight_ask(
+    project_id: str,
+    question: str,
+    wig_id: str | None = None,
+    measure_id: str | None = None,
+) -> dict[str, Any]:
+    cleaned = (question or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Question is required")
+    context = collect_contextual_insight_context(project_id, wig_id, measure_id)
+    return openai_contextual_insight_ask(cleaned, context)
+
+
+INSIGHT_PRESETS = {
+    "not_working": "What is not working across the portfolio right now? Identify the weakest projects, stalled WIGs, and recurring bottlenecks.",
+    "not_updating": "Who is not updating their work? List the owners with lead measures that have no recent progress updates or comments, and what they own.",
+    "at_risk": "Which projects are at risk and why? Rank them, explain the drivers, and state what would recover each one.",
+    "budget": "Which projects, WIGs, or lead measures are over or under budget? Highlight overspend, over-allocation, and where funds remain unassigned.",
+}
+
+
+@app.post("/api/ai/insight")
+def create_ai_insight(payload: AIInsightIn, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    question = (payload.question or "").strip() or INSIGHT_PRESETS.get(payload.preset or "", "")
+    if not question:
+        question = "Give me an executive summary of portfolio execution: what is working, what is not, and who needs to act."
+    context = collect_insight_context(question, payload.stale_days)
+    insight = openai_portfolio_insight(context, question)
+    record = {
+        "question": question,
+        "preset": payload.preset,
+        "insight": insight,
+        "portfolio_snapshot": context["portfolio"],
+        "created_by": user["phone"],
+        "created_at": datetime.utcnow(),
+    }
+    db.ai_insights.insert_one(record)
+    return {
+        "question": question,
+        "insight": insight,
+        "data": {
+            "portfolio": context["portfolio"],
+            "at_risk_projects": context["at_risk_projects"],
+            "stale_owners": context["stale_owners"],
+            "stale_measures": context["stale_measures"][:12],
+            "top_bottlenecks": context["top_bottlenecks"],
+            "stale_days": context["stale_days"],
+            "budget": context.get("budget", {}),
+        },
+    }
+
+
+@app.post("/api/ai/insight/project/{project_id}")
+def ai_insight_project(project_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    return generate_contextual_insight(project_id)
+
+
+@app.post("/api/ai/insight/wig/{project_id}/{wig_id}")
+def ai_insight_wig(project_id: str, wig_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    return generate_contextual_insight(project_id, wig_id=wig_id)
+
+
+@app.post("/api/ai/insight/measure/{project_id}/{wig_id}/{measure_id}")
+def ai_insight_measure(
+    project_id: str,
+    wig_id: str,
+    measure_id: str,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    return generate_contextual_insight(project_id, wig_id=wig_id, measure_id=measure_id)
+
+
+@app.post("/api/ai/insight/project/{project_id}/ask")
+def ai_insight_project_ask(
+    project_id: str,
+    payload: ContextualInsightAskIn,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    return generate_contextual_insight_ask(project_id, payload.question)
+
+
+@app.post("/api/ai/insight/wig/{project_id}/{wig_id}/ask")
+def ai_insight_wig_ask(
+    project_id: str,
+    wig_id: str,
+    payload: ContextualInsightAskIn,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    return generate_contextual_insight_ask(project_id, payload.question, wig_id=wig_id)
+
+
+@app.post("/api/ai/insight/measure/{project_id}/{wig_id}/{measure_id}/ask")
+def ai_insight_measure_ask(
+    project_id: str,
+    wig_id: str,
+    measure_id: str,
+    payload: ContextualInsightAskIn,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    return generate_contextual_insight_ask(
+        project_id,
+        payload.question,
+        wig_id=wig_id,
+        measure_id=measure_id,
+    )
 
 
 @app.get("/api/health")
@@ -1467,14 +3371,93 @@ def health() -> dict[str, str]:
 @app.get("/api/public/settings")
 def public_settings() -> dict[str, Any]:
     settings = db.settings.find_one({"key": "branding"}, {"_id": 0})
+    app_mode_doc = db.settings.find_one({"key": "app_mode"}, {"_id": 0, "key": 0}) or {}
     if not settings:
-        return {"title": "Government 4DX Execution Dashboard", "department": "", "banner": "", "logo_url": ""}
-    return settings
+        payload = {
+            "title": "4DX Execution Platform",
+            "department": "Strategic Delivery Office",
+            "banner": "Focus. Measure. Score. Execute.",
+            "logo_url": "",
+            "locale": "en",
+            "region": "global",
+            "currency": "USD",
+            "timezone": "UTC",
+            "org_type": "enterprise",
+        }
+    else:
+        payload = dict(settings)
+        payload.pop("key", None)
+    payload["app_mode"] = app_mode_doc.get("mode", get_app_mode())
+    payload["auto_load_demo"] = bool(app_mode_doc.get("auto_load_demo"))
+    if DEMO_OTP_MODE:
+        payload["demo_admin_phones"] = sorted(ADMIN_PHONES)
+    return payload
+
+
+@app.get("/api/public/regions")
+def public_regions() -> list[dict[str, Any]]:
+    return REGION_CATALOG
+
+
+@app.get("/api/portfolio/export")
+def export_portfolio(user: dict[str, Any] = Depends(current_user)) -> StreamingResponse:
+    refresh_all_project_health()
+    ministries = {str(doc["_id"]): doc.get("name", "") for doc in db.ministries.find()}
+    projects = [clean_id(doc) for doc in db.projects.find().sort("name", 1)]
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([
+        "Project",
+        "Department",
+        "Owner",
+        "Status",
+        "Health Score",
+        "Health State",
+        "Phase",
+        "Due Date",
+        "Budget",
+        "Spent",
+        "WIGs",
+        "Lead Measures",
+        "Schedule KPI",
+        "Lead KPI",
+        "Cadence KPI",
+    ])
+    for project in projects:
+        wigs = [wig for wig in project.get("wigs", []) if not wig.get("archived_at")]
+        measure_count = sum(
+            len([measure for measure in wig.get("lead_measures", []) if not measure.get("archived_at")])
+            for wig in wigs
+        )
+        kpis = project.get("kpis") or {}
+        writer.writerow([
+            project.get("name", ""),
+            project.get("ministry") or ministries.get(str(project.get("ministry_id", "")), ""),
+            project.get("owner", ""),
+            project.get("status", ""),
+            project.get("health_score", ""),
+            project.get("health_state", ""),
+            project.get("phase", ""),
+            project.get("due_date", ""),
+            project.get("budget_crore", ""),
+            project.get("spent_crore", ""),
+            len(wigs),
+            measure_count,
+            kpis.get("schedule", ""),
+            kpis.get("lead_measures", ""),
+            kpis.get("cadence", ""),
+        ])
+    buffer.seek(0)
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="4dx-portfolio.csv"'},
+    )
 
 
 @app.post("/api/auth/request-otp")
 def request_otp(payload: PhoneRequest) -> dict[str, str]:
-    phone = payload.phone.strip()
+    phone = normalize_phone(payload.phone)
     if len(phone) < 6:
         raise HTTPException(status_code=400, detail="Enter a valid mobile number")
     otp = f"{random.randint(100000, 999999)}"
@@ -1483,16 +3466,22 @@ def request_otp(payload: PhoneRequest) -> dict[str, str]:
         {"$set": {"otp": otp, "created_at": datetime.utcnow(), "used": False}},
         upsert=True,
     )
-    return {"message": "OTP generated", "demo_otp": otp}
+    response: dict[str, str] = {"message": "OTP sent"}
+    if DEMO_OTP_MODE:
+        response["demo_otp"] = otp
+    return response
 
 
 @app.post("/api/auth/verify-otp")
 def verify_otp(payload: VerifyRequest) -> dict[str, Any]:
-    phone = payload.phone.strip()
+    phone = normalize_phone(payload.phone)
     record = db.otp_requests.find_one({"phone": phone, "otp": payload.otp, "used": False})
     if not record:
         raise HTTPException(status_code=400, detail="Invalid OTP")
-    role = "admin" if phone.endswith("0000") else "user"
+    created_at = record.get("created_at")
+    if created_at and created_at < datetime.utcnow() - timedelta(minutes=10):
+        raise HTTPException(status_code=400, detail="OTP expired")
+    role = "admin" if phone in ADMIN_PHONES else "user"
     db.users.update_one(
         {"phone": phone},
         {"$set": {"phone": phone, "role": role, "updated_at": datetime.utcnow()}, "$setOnInsert": {"created_at": datetime.utcnow()}},
@@ -1502,6 +3491,15 @@ def verify_otp(payload: VerifyRequest) -> dict[str, Any]:
     user = db.users.find_one({"phone": phone})
     token = token_for(user)
     return {"token": token, "user": clean_id(user)}
+
+
+@app.get("/api/auth/me")
+def auth_me(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    role = "admin" if user.get("phone") in ADMIN_PHONES else "user"
+    if user.get("role") != role:
+        db.users.update_one({"_id": user["_id"]}, {"$set": {"role": role, "updated_at": datetime.utcnow()}})
+        user = db.users.find_one({"_id": user["_id"]})
+    return {"user": clean_id(user)}
 
 
 @app.get("/api/overview")
@@ -1537,6 +3535,44 @@ def overview(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
             "Utility shifting and land possession drive most critical escalations.",
             "Some teams still upload evidence after review instead of before review.",
         ],
+        "health_trend": portfolio_health_trend(),
+        "pending_approvals": db.approvals.count_documents({"status": "Pending"}),
+    }
+
+
+@app.get("/api/scoreboard")
+def scoreboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    rows = build_scoreboard_rows()
+    counts: dict[str, int] = {}
+    for row in rows:
+        state = row["health_state"]
+        counts[state] = counts.get(state, 0) + 1
+    return {"rows": rows, "counts": counts, "total": len(rows)}
+
+
+@app.get("/api/approvals")
+def list_approvals(status: str | None = None, user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+    query: dict[str, Any] = {}
+    if status:
+        query["status"] = status
+    rows = [clean_id(doc) for doc in db.approvals.find(query).sort("created_at", -1).limit(50)]
+    project_names = {str(p["_id"]): p["name"] for p in db.projects.find({}, {"name": 1})}
+    for row in rows:
+        row["project_name"] = project_names.get(str(row.get("project_id")), "Project")
+    return rows
+
+
+@app.get("/api/cadence")
+def cadence_summary(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    meetings = [clean_id(doc) for doc in db.weekly_meetings.find().sort("meeting_date", -1).limit(20)]
+    project_names = {str(p["_id"]): p["name"] for p in db.projects.find({}, {"name": 1})}
+    for meeting in meetings:
+        meeting["project_name"] = project_names.get(str(meeting.get("project_id")), "Project")
+    open_assignments = [clean_id(doc) for doc in db.assignments.find({"status": {"$ne": "Done"}}).sort("due_date", 1).limit(12)]
+    return {
+        "meetings": meetings,
+        "assignments": open_assignments,
+        "scoreboard_summary": build_scoreboard_rows()[:8],
     }
 
 
@@ -1582,6 +3618,7 @@ def create_project(payload: ProjectIn, user: dict[str, Any] = Depends(current_us
         "wig": initial_wig or "Define WIG / Milestone",
         "due_date": payload.due_date,
         "budget_crore": payload.budget_crore,
+        "priority": payload.priority,
         "spent_crore": 0,
         "kpis": {
             "schedule": 70,
@@ -1613,6 +3650,24 @@ def create_project(payload: ProjectIn, user: dict[str, Any] = Depends(current_us
     return clean_id(refreshed)
 
 
+@app.put("/api/projects/{project_id}")
+def update_project(project_id: str, payload: ProjectUpdateIn, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    project = db.projects.find_one({"_id": oid(project_id)})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    require_project_editor(project, user)
+    before = dict(project)
+    updates = payload.model_dump(exclude_none=True)
+    if not updates:
+        return clean_id(project)
+    updates["updated_by"] = user["phone"]
+    updates["updated_at"] = datetime.utcnow()
+    db.projects.update_one({"_id": project["_id"]}, {"$set": updates})
+    refreshed = refresh_project_health(project["_id"])
+    log_audit("update", "project", project, user, before=before, after=updates)
+    return clean_id(refreshed)
+
+
 @app.post("/api/projects/{project_id}/wigs")
 def add_wig(project_id: str, payload: WigIn, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     project = db.projects.find_one({"_id": oid(project_id)})
@@ -1620,6 +3675,11 @@ def add_wig(project_id: str, payload: WigIn, user: dict[str, Any] = Depends(curr
         raise HTTPException(status_code=404, detail="Project not found")
     require_project_editor(project, user)
     wig = payload.model_dump()
+    wig["update_frequency"] = normalize_update_frequency(wig.get("update_frequency"))
+    if wig.get("priority") is None:
+        wig["priority"] = project.get("priority", 5)
+    validate_project_wig_budget(project, additional=float(wig.get("budget_allocated") or 0))
+    validate_wig_deadline(project, wig.get("deadline"))
     wig["id"] = str(uuid.uuid4())
     wig["lead_measures"] = []
     db.projects.update_one({"_id": project["_id"]}, {"$push": {"wigs": wig}, "$set": {"updated_by": user["phone"], "updated_at": datetime.utcnow()}})
@@ -1638,8 +3698,13 @@ def update_wig(project_id: str, wig_id: str, payload: WigUpdateIn, user: dict[st
     if not wig:
         raise HTTPException(status_code=404, detail="WIG not found")
     before = dict(wig)
-    for key, value in payload.model_dump(exclude_none=True).items():
+    updates = payload.model_dump(exclude_none=True)
+    if "update_frequency" in updates:
+        updates["update_frequency"] = normalize_update_frequency(updates["update_frequency"])
+    for key, value in updates.items():
         wig[key] = value
+    validate_project_wig_budget(project, additional=float(wig.get("budget_allocated") or 0), exclude_wig_id=wig_id)
+    validate_wig_deadline(project, wig.get("deadline"))
     refreshed = upsert_project_after_nested_change(project, user)
     log_audit("update", "wig", project, user, before=before, after=wig)
     return clean_id(refreshed)
@@ -1668,7 +3733,14 @@ def add_lead_measure(project_id: str, wig_id: str, payload: LeadMeasureIn, user:
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     require_project_editor(project, user)
+    parent_wig = find_wig(project, wig_id)
+    if not parent_wig:
+        raise HTTPException(status_code=404, detail="WIG not found")
     measure = payload.model_dump()
+    if measure.get("priority") is None:
+        measure["priority"] = parent_wig.get("priority", project.get("priority", 5))
+    validate_wig_measure_budget(parent_wig, additional=float(measure.get("budget_allocated") or 0))
+    validate_measure_deadline(project, parent_wig, measure.get("deadline"))
     measure["id"] = str(uuid.uuid4())
     measure["current_value"] = measure["from_value"]
     measure["status"] = "Open"
@@ -1699,6 +3771,8 @@ def update_lead_measure(project_id: str, wig_id: str, measure_id: str, payload: 
     before = dict(measure)
     for key, value in payload.model_dump(exclude_none=True).items():
         measure[key] = value
+    validate_wig_measure_budget(wig, additional=float(measure.get("budget_allocated") or 0), exclude_measure_id=measure_id)
+    validate_measure_deadline(project, wig, measure.get("deadline"))
     refreshed = upsert_project_after_nested_change(project, user)
     log_audit("update", "lead_measure", project, user, before=before, after=measure, metadata={"wig_id": wig_id})
     return clean_id(refreshed)
@@ -1911,6 +3985,126 @@ def create_weekly_meeting(payload: WeeklyMeetingIn, user: dict[str, Any] = Depen
     return clean_id(doc)
 
 
+@app.post("/api/projects/{project_id}/meeting-to-action/parse")
+def meeting_to_action_parse(project_id: str, payload: MeetingNotesIn, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    project = db.projects.find_one({"_id": oid(project_id)})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    require_project_editor(project, user)
+    notes = (payload.notes or "").strip()
+    if not notes:
+        raise HTTPException(status_code=400, detail="Meeting notes are required")
+    ministry_id = (payload.ministry_id or "").strip() or str(project.get("ministry_id") or "")
+    if not ministry_id:
+        raise HTTPException(status_code=400, detail="Ministry is required")
+    if str(project.get("ministry_id")) != ministry_id:
+        raise HTTPException(status_code=400, detail="Project does not belong to selected ministry")
+    ministry_projects = list(db.projects.find({"ministry_id": oid(ministry_id)}))
+    project = refresh_project_health(project["_id"])
+    preview = parse_meeting_notes(notes, project, ministry_projects=ministry_projects)
+    preview["catalog"] = build_ministry_catalog(ministry_projects)
+    preview["ministry_id"] = ministry_id
+    return preview
+
+
+@app.post("/api/ministries/{ministry_id}/meeting-to-action/parse")
+def ministry_meeting_to_action_parse(ministry_id: str, payload: MeetingNotesIn, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    notes = (payload.notes or "").strip()
+    if not notes:
+        raise HTTPException(status_code=400, detail="Meeting notes are required")
+    ministry_projects = list(db.projects.find({"ministry_id": oid(ministry_id)}))
+    if not ministry_projects:
+        raise HTTPException(status_code=404, detail="No projects found for this ministry")
+    for proj in ministry_projects:
+        require_project_editor(proj, user)
+    anchor = refresh_project_health(ministry_projects[0]["_id"])
+    preview = parse_meeting_notes(notes, anchor, ministry_projects=ministry_projects)
+    preview["catalog"] = build_ministry_catalog(ministry_projects)
+    preview["ministry_id"] = ministry_id
+    return preview
+
+
+@app.post("/api/projects/{project_id}/meeting-to-action/apply")
+def meeting_to_action_apply(project_id: str, payload: MeetingToActionApplyIn, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    project = db.projects.find_one({"_id": oid(project_id)})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    require_project_editor(project, user)
+    ministry_id = (payload.ministry_id or "").strip() or str(project.get("ministry_id") or "")
+    if not ministry_id:
+        raise HTTPException(status_code=400, detail="Ministry is required")
+    if str(project.get("ministry_id")) != ministry_id:
+        raise HTTPException(status_code=400, detail="Project does not belong to selected ministry")
+    project = refresh_project_health(project["_id"], vectorize=False)
+    payload_data = payload.model_dump()
+    for key in ("proposed_wigs", "proposed_measures", "proposed_actions"):
+        for item in payload_data.get(key) or []:
+            if item.get("project_id"):
+                continue
+            item["project_id"] = project_id
+    try:
+        result = apply_meeting_to_action(
+            project,
+            payload_data,
+            user,
+            db=db,
+            normalize_update_frequency=normalize_update_frequency,
+            validate_project_wig_budget=validate_project_wig_budget,
+            validate_wig_deadline=validate_wig_deadline,
+            validate_wig_measure_budget=validate_wig_measure_budget,
+            validate_measure_deadline=validate_measure_deadline,
+            refresh_project_health=refresh_project_health,
+            log_audit=log_audit,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to apply meeting actions") from exc
+    return {
+        "status": "applied",
+        "created_wigs": result["created_wigs"],
+        "created_measures": result["created_measures"],
+        "comments_posted": result["comments_posted"],
+        "assignments_created": result["assignments_created"],
+        "project": clean_id(result["project"]),
+    }
+
+
+@app.post("/api/ministries/{ministry_id}/meeting-to-action/apply")
+def ministry_meeting_to_action_apply(ministry_id: str, payload: MeetingToActionApplyIn, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    payload_data = payload.model_dump()
+    try:
+        result = apply_ministry_meeting_to_action(
+            ministry_id,
+            payload_data,
+            user,
+            db=db,
+            find_project=lambda project_id: db.projects.find_one({"_id": oid(project_id)}),
+            normalize_update_frequency=normalize_update_frequency,
+            validate_project_wig_budget=validate_project_wig_budget,
+            validate_wig_deadline=validate_wig_deadline,
+            validate_wig_measure_budget=validate_wig_measure_budget,
+            validate_measure_deadline=validate_measure_deadline,
+            refresh_project_health=refresh_project_health,
+            log_audit=log_audit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to apply meeting actions") from exc
+    return {
+        "status": "applied",
+        "created_wigs": result["created_wigs"],
+        "created_measures": result["created_measures"],
+        "comments_posted": result["comments_posted"],
+        "assignments_created": result["assignments_created"],
+        "projects_updated": result["projects_updated"],
+        "project": clean_id(result["project"]) if result.get("project") else None,
+    }
+
+
 @app.get("/api/search")
 def semantic_search(q: str, state: str | None = None, limit: int = 10, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     normalized_state = state.lower() if state else None
@@ -2078,6 +4272,11 @@ def update_decision_status(decision_id: str, status: str, user: dict[str, Any] =
     return clean_id(doc)
 
 
+@app.get("/api/admin/llm-status")
+def admin_llm_status(admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    return get_llm_provider_status()
+
+
 @app.put("/api/admin/settings")
 def update_settings(payload: SettingsIn, admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     update = {k: v for k, v in payload.model_dump().items() if v is not None}
@@ -2088,7 +4287,52 @@ def update_settings(payload: SettingsIn, admin: dict[str, Any] = Depends(require
 
 
 @app.post("/api/admin/reseed")
-def reseed(admin: dict[str, Any] = Depends(require_admin)) -> dict[str, str]:
-    db.settings.update_one({"key": "seed_version"}, {"$set": {"value": "reseed_requested"}})
-    seed_database()
-    return {"status": "reseeded"}
+def reseed(admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    result = reseed_demo_payload()
+    return {"status": "reseeded", **result}
+
+
+@app.put("/api/admin/app-mode")
+def update_app_mode(payload: AppModeIn, admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    result = set_app_mode(payload.mode, payload.auto_load_demo)
+    if payload.mode == "dev" and payload.auto_load_demo:
+        reseed_demo_payload()
+        result["reseeded"] = True
+    result["settings"] = public_settings()
+    return result
+
+
+@app.get("/api/admin/cleanup-db")
+def preview_cleanup_db(admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    orphans = list_orphan_collections(db)
+    droppable = [item for item in orphans if item["safe_to_drop"]]
+    return {
+        "allowed_collections": sorted(ALLOWED_COLLECTIONS),
+        "orphans": orphans,
+        "will_drop": [item["name"] for item in droppable],
+    }
+
+
+@app.post("/api/admin/cleanup-db")
+def cleanup_db(admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    return cleanup_orphan_collections(db, dry_run=False)
+
+
+@app.post("/api/admin/reseed-demo")
+async def reseed_demo(
+    confirm: bool = Form(default=False),
+    file: UploadFile | None = File(default=None),
+    admin: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    mode = get_app_mode()
+    if mode == "prod" and not confirm:
+        raise HTTPException(status_code=400, detail="Production reseed requires confirm=true")
+    data: dict[str, Any] | None = None
+    if file and file.filename:
+        raw = await file.read()
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON upload: {exc}") from exc
+    result = reseed_demo_payload(data)
+    return {"status": "reseeded", **result}

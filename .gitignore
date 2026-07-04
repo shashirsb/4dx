@@ -1,1 +1,10 @@
 node_modules
+dist
+.venv
+.env
+backend/.env
+.DS_Store
+__pycache__
+*.pyc
+.npm-cache
+tmp
