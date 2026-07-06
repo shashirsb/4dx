@@ -97,6 +97,28 @@ const UPDATE_FREQUENCY_OPTIONS = [
   { id: 'monthly', label: 'Monthly' },
 ];
 
+const GLOBAL_ADMIN_ROLES = new Set(['executive_assistant', 'admin']);
+
+function isGlobalAdminUser(user) {
+  return GLOBAL_ADMIN_ROLES.has(user?.role);
+}
+
+function canOpenAdmin(user) {
+  return isGlobalAdminUser(user);
+}
+
+function roleLabel(role) {
+  const labels = {
+    chief_minister: 'Chief Minister',
+    minister: 'Minister',
+    executive_assistant: 'Executive Assistant',
+    ministry_admin: 'Ministry Admin',
+    admin: 'Global Admin',
+    user: 'General User',
+  };
+  return labels[role] || 'General User';
+}
+
 function formatFreqLabel(freq) {
   return UPDATE_FREQUENCY_OPTIONS.find(o => o.id === freq)?.label || freq || 'Weekly';
 }
@@ -215,7 +237,7 @@ function CommandPalette({ open, onClose, projects, locale, onNavigate, onExport,
     ['decisions', Gavel, t('decisions', locale)],
     ['evidence', Brain, t('evidence', locale)],
   ];
-  if (session?.user?.role === 'admin') views.push(['admin', Settings, t('admin', locale)]);
+  if (canOpenAdmin(session?.user)) views.push(['admin', Settings, t('admin', locale)]);
 
   const items = useMemo(() => {
     const text = query.trim().toLowerCase();
@@ -330,7 +352,7 @@ function App() {
   const [settings, setSettings] = useState(null);
   const [locale, setLocale] = useState(() => localStorage.getItem('locale') || 'en');
   const [overview, setOverview] = useState(null);
-  const [active, setActive] = useState('projects');
+  const [active, setActive] = useState('overview');
   const [loading, setLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [error, setError] = useState('');
@@ -521,7 +543,6 @@ function App() {
 
   return (
     <div className={`app-shell ${sidebarOpen ? 'sidebar-open' : ''}`}>
-      <Sidebar active={active} setActive={navigate} settings={settings} session={session} locale={locale} orgType={orgType} onLogout={() => setSession(null)} />
       <div className="workspace">
         <TopBar
           active={active}
@@ -535,6 +556,8 @@ function App() {
           stats={overview?.stats}
           onExport={exportPortfolio}
           onOpenPalette={() => setPaletteOpen(true)}
+          onNavigate={navigate}
+          onLogout={() => setSession(null)}
         />
         {error && (
           <div className="error-banner">
@@ -543,7 +566,7 @@ function App() {
           </div>
         )}
         <div className="page-content">
-          {!(active === 'projects' && openProjectId) && (
+          {active !== 'projects' && (
             <GlobalFilters projects={projects} ministries={ministries} filters={filters} setFilters={setFilters} resultCount={filteredProjects.length} locale={locale} orgType={orgType} />
           )}
           {active === 'overview' && <CommandCenter overview={filteredOverview} loading={loading} locale={locale} onNavigate={navigate} onExport={exportPortfolio} />}
@@ -567,6 +590,8 @@ function App() {
               projects={filteredProjects}
               allProjects={projects}
               ministries={ministries}
+              permissions={overview?.permissions}
+              session={session}
               api={api}
               reload={loadOverview}
               onOpen={id => openWorkspace({ projectId: id })}
@@ -590,10 +615,9 @@ function App() {
           {active === 'workflow' && <Workflow overview={filteredOverview} api={api} reload={loadOverview} />}
           {active === 'evidence' && <AIInsight projects={filteredProjects} api={api} reload={loadOverview} notify={pushToast} onOpenProject={id => navigate('projects', id)} />}
           {active === 'decisions' && <Decisions overview={filteredOverview} api={api} reload={loadOverview} />}
-          {active === 'admin' && session.user.role === 'admin' && <Admin settings={settings} setSettings={setSettings} api={api} reload={loadOverview} locale={locale} setLocale={setLocale} />}
+          {active === 'admin' && canOpenAdmin(session.user) && <Admin settings={settings} setSettings={setSettings} api={api} reload={loadOverview} locale={locale} setLocale={setLocale} />}
         </div>
       </div>
-      {sidebarOpen && <button className="sidebar-backdrop" aria-label="Close menu" onClick={() => setSidebarOpen(false)} />}
       <CommandPalette
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
@@ -682,46 +706,58 @@ function Login({ settings, locale, setLocale, onSession }) {
   }
 
   return (
-    <div className="login-page">
-      <div className="login-hero">
-        <div className="login-hero-top">
-          <span className="world-badge">🌍 Global 4DX Platform</span>
-          <LocaleSwitcher locale={locale} setLocale={setLocale} />
-        </div>
-        <h1>{t('fourDisciplinesTitle', locale)}</h1>
-        <p>{settings?.banner || settings?.department || t('tagline', locale)}</p>
-        <div className="login-disciplines">
-          <div className="login-discipline"><span>D1</span><strong>{t('d1', locale)}</strong></div>
-          <div className="login-discipline"><span>D2</span><strong>{t('d2', locale)}</strong></div>
-          <div className="login-discipline"><span>D3</span><strong>{t('d3', locale)}</strong></div>
-          <div className="login-discipline"><span>D4</span><strong>{t('d4', locale)}</strong></div>
-        </div>
-      </div>
-      <motion.form className="login-panel" initial={{ opacity: 0, x: 16 }} animate={{ opacity: 1, x: 0 }} onSubmit={step === 'phone' ? requestOtp : verifyOtp}>
-        <h2>{settings?.title || t('appName', locale)}</h2>
-        <p>{t('signInPrompt', locale)}</p>
-        <label>
-          <span>{t('mobile', locale)}</span>
-          <div className="input-wrap"><Phone size={18} /><input value={phone} onChange={e => setPhone(e.target.value)} placeholder={t('mobile', locale)} required /></div>
-        </label>
-        {step === 'otp' && (
-          <label>
-            <span>{t('otp', locale)}</span>
-            <div className="input-wrap"><LockKeyhole size={18} /><input value={otp} onChange={e => setOtp(e.target.value)} placeholder="6 digit OTP" required /></div>
-            {demoOtp && <small style={{ color: 'var(--text-muted)', fontSize: 12 }}>Demo OTP: {demoOtp}</small>}
-          </label>
-        )}
-        {error && <div className="error">{error}</div>}
-        <button className="primary-btn" type="submit" style={{ width: '100%', justifyContent: 'center', padding: '12px' }}>
-          {step === 'phone' ? t('sendOtp', locale) : t('signIn', locale)}<ChevronRight size={18} />
-        </button>
-        <div className="demo-note">{t('demoNote', locale)}</div>
-        {settings?.demo_admin_phones?.length > 0 && (
-          <div className="demo-note admin-login-hint">
-            {t('adminLoginHint', locale)} {settings.demo_admin_phones.join(' · ')}
+    <div className="login-page gov-login">
+      <header className="gov-login-banner">
+        <img src="/karnataka-ai-header-compact.png" alt="Government of Karnataka AI in Government" />
+      </header>
+      <main className="gov-login-main">
+        <section className="gov-login-left">
+          <h1><span>4DX</span> Government Execution Platform</h1>
+          <p>Decision with help of AI</p>
+          <div className="login-disciplines gov-disciplines">
+            <div className="login-discipline"><Target size={30} /><strong>WIGs</strong><small>Focus on what matters most</small></div>
+            <div className="login-discipline"><TrendingUp size={30} /><strong>Lead Measures</strong><small>Track the right drivers</small></div>
+            <div className="login-discipline"><Gauge size={30} /><strong>Scoreboard</strong><small>Make progress transparent</small></div>
+            <div className="login-discipline"><CalendarClock size={30} /><strong>Cadence</strong><small>Run effective weekly rhythms</small></div>
           </div>
-        )}
-      </motion.form>
+        </section>
+        <motion.form className="login-panel gov-login-panel" initial={{ opacity: 0, x: 16 }} animate={{ opacity: 1, x: 0 }} onSubmit={step === 'phone' ? requestOtp : verifyOtp}>
+          <Shield className="login-shield" size={42} />
+          <h2>Sign in with mobile OTP</h2>
+          <label>
+            <span>Mobile number</span>
+            <div className="input-wrap"><Phone size={18} /><input value={phone} onChange={e => setPhone(e.target.value)} placeholder="Enter 10 digit mobile number" required /></div>
+            <small>We will send a one-time password (OTP) to this number.</small>
+          </label>
+          <label>
+            <span>OTP</span>
+            <div className="input-wrap">
+              <LockKeyhole size={18} />
+              <input value={otp} onChange={e => setOtp(e.target.value)} placeholder="Enter 6 digit OTP" disabled={step === 'phone'} required={step === 'otp'} />
+              {step === 'otp' && <button className="link-btn" type="button" onClick={requestOtp}>Resend OTP</button>}
+            </div>
+            {demoOtp && <small>Demo OTP: {demoOtp}</small>}
+          </label>
+          {error && <div className="error">{error}</div>}
+          <button className="primary-btn" type="submit">
+            {step === 'phone' ? 'Continue' : 'Continue'}
+          </button>
+          <div className="access-note"><LockKeyhole size={14} /> Access is role based:</div>
+          <div className="role-login-grid">
+            <span><UserRound size={22} />CM Office</span>
+            <span><Landmark size={22} />Minister</span>
+            <span><Users size={22} />Executive Assistant</span>
+            <span><Landmark size={22} />Ministry Admin</span>
+            <span><UserRound size={22} />General User</span>
+          </div>
+        </motion.form>
+      </main>
+      <footer className="gov-login-footer">
+        <span><Shield size={28} /><b>Trusted. Secure. Government.</b><small>Built for Karnataka.</small></span>
+        <span><LockKeyhole size={26} /><b>Secure by Design</b><small>Data is encrypted and role based.</small></span>
+        <span><Landmark size={28} /><b>Government of Karnataka</b><small>Official execution platform.</small></span>
+        <span><Shield size={26} /><b>CERT-In Compliant</b><small>Aligned with cyber standards.</small></span>
+      </footer>
     </div>
   );
 }
@@ -737,7 +773,7 @@ function Sidebar({ active, setActive, settings, session, locale, orgType, onLogo
     ['evidence', Brain, t('evidence', locale)],
     ['decisions', Gavel, t('decisions', locale)],
   ];
-  if (session.user.role === 'admin') items.push(['admin', Settings, t('admin', locale)]);
+  if (canOpenAdmin(session.user)) items.push(['admin', Settings, t('admin', locale)]);
 
   return (
     <aside className="sidebar">
@@ -757,35 +793,63 @@ function Sidebar({ active, setActive, settings, session, locale, orgType, onLogo
   );
 }
 
-function TopBar({ active, settings, session, locale, setLocale, refresh, loading, onMenu, stats, onExport, onOpenPalette }) {
-  const [title, subtitle] = pageMeta(active, locale);
+function TopBar({ active, settings, session, locale, setLocale, refresh, loading, stats, onExport, onOpenPalette, onNavigate, onLogout }) {
   const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform);
+  const navItems = [
+    ['overview', Home, 'Overview'],
+    ['ministries', Landmark, 'Ministries'],
+    ['projects', ClipboardList, 'Projects'],
+    ['workflow', Users, 'Workflow'],
+    ['evidence', Brain, 'Evidence AI'],
+    ['decisions', Gavel, 'Decisions'],
+    ['scoreboard', Gauge, 'Reports'],
+  ];
+  if (canOpenAdmin(session.user)) navItems.push(['admin', Settings, 'Admin']);
   return (
     <header className="app-header">
-      <div className="header-left">
-        <button className="icon-btn menu-btn" onClick={onMenu} aria-label="Toggle navigation"><Menu size={18} /></button>
+      <div className="top-brand">
+        <img src="/karnataka-header-left.png" alt="Government of Karnataka" />
         <div>
-          <h1>{title}</h1>
-          <p>{subtitle}</p>
+          <strong>AI in Government of Karnataka</strong>
+          <span>Decision with help of AI</span>
         </div>
       </div>
+      <nav className="top-nav" aria-label="Primary navigation">
+        {navItems.map(([id, Icon, label]) => (
+          <button
+            key={id}
+            type="button"
+            className={active === id ? 'active' : ''}
+            onClick={() => onNavigate(id)}
+          >
+            <Icon size={16} />
+            <span>{label}</span>
+          </button>
+        ))}
+      </nav>
       <div className="header-actions">
-        <button className="cmdk-trigger" onClick={onOpenPalette}>
+        <button className="cmdk-trigger compact" onClick={onOpenPalette}>
           <Search size={14} />
-          <span className="cmdk-trigger-label">Search…</span>
-          <kbd>{isMac ? '⌘K' : 'Ctrl K'}</kbd>
+          <span className="cmdk-trigger-label">Search anything...</span>
         </button>
-        {settings?.region && settings.region !== 'global' && (
-          <span className="user-pill region-pill">{regionById(settings.region).flag} {regionById(settings.region).label}</span>
-        )}
-        <LocaleSwitcher locale={locale} setLocale={setLocale} compact />
-        {stats && <span className="user-pill"><Activity size={14} /> {stats.health_score}%</span>}
-        <button className="ghost-btn" onClick={onExport}><Download size={15} /> {t('exportPortfolio', locale)}</button>
-        <button className="refresh-btn" onClick={refresh}><RefreshCw size={15} className={loading ? 'spin' : ''} /> {t('refresh', locale)}</button>
-        <div className="user-pill"><UserRound size={16} /> {session.user.phone}</div>
+        <button className="icon-btn alert-icon" title="Alerts"><Bell size={15} />{overviewAlertDot(stats)}</button>
+        <div className="top-user">
+          <span className="avatar">{(session.user.display_name || session.user.phone || 'U').slice(0, 2).toUpperCase()}</span>
+          <div>
+            <strong>{session.user.display_name || session.user.phone}</strong>
+            <small>{roleLabel(session.user.role)}</small>
+          </div>
+        </div>
+        <button className="icon-btn" onClick={refresh} title="Refresh"><RefreshCw size={15} className={loading ? 'spin' : ''} /></button>
+        <button className="icon-btn danger" onClick={onLogout} title={t('signOut', locale)}><LogOut size={15} /></button>
       </div>
     </header>
   );
+}
+
+function overviewAlertDot(stats) {
+  if (!stats?.off_track && !stats?.at_risk) return null;
+  return <span className="alert-dot">{Number(stats.off_track || 0) + Number(stats.at_risk || 0)}</span>;
 }
 
 function GlobalFilters({ projects, ministries, filters, setFilters, resultCount, locale, orgType }) {
@@ -2195,143 +2259,109 @@ function CommandCenter({ overview, loading, locale, onNavigate, onExport }) {
   if (loading && !overview) return <OverviewSkeleton />;
   const stats = overview?.stats || { total: 0, on_track: 0, at_risk: 0, off_track: 0, health_score: 0 };
   const projects = overview?.projects || [];
-  const storedTrend = overview?.health_trend || [];
-  const trend = storedTrend.length >= 2 ? storedTrend : [
-    { name: 'W1', value: Math.max(35, stats.health_score - 18) },
-    { name: 'W2', value: Math.max(40, stats.health_score - 10) },
-    { name: 'W3', value: Math.max(42, stats.health_score - 7) },
-    { name: 'Now', value: stats.health_score },
-  ];
-  const trendDelta = trend.length >= 2 ? trend[trend.length - 1].value - trend[trend.length - 2].value : 0;
   const attention = projects.filter(p => p.status !== 'On Track');
-  const heatRows = [...projects].sort((a, b) => (a.health_score || 0) - (b.health_score || 0)).slice(0, 7);
-  const pulseRows = [...projects].sort((a, b) => (a.health_score || 0) - (b.health_score || 0)).slice(0, 6);
+  const evidenceGaps = projects.reduce((sum, project) => sum + Math.max(0, countMeasures(project) - (project.evidence_count || 0)), 0);
+  const trend = overview?.health_trend?.length ? overview.health_trend : [
+    { name: 'W2', on_track: Math.max(0, stats.on_track - 3), at_risk: Math.max(0, stats.at_risk - 1), off_track: Math.max(0, stats.off_track - 1) },
+    { name: 'W3', on_track: Math.max(0, stats.on_track - 2), at_risk: stats.at_risk, off_track: stats.off_track },
+    { name: 'W4', on_track: Math.max(0, stats.on_track - 1), at_risk: stats.at_risk, off_track: stats.off_track },
+    { name: 'Now', on_track: stats.on_track, at_risk: stats.at_risk, off_track: stats.off_track },
+  ];
 
   return (
-    <section>
-      <div className="discipline-strip">
-        {[
-          [t('d1Short', locale), t('d1Desc', locale)],
-          [t('d2Short', locale), t('d2Desc', locale)],
-          [t('d3Short', locale), t('d3Desc', locale)],
-          [t('d4Short', locale), t('d4Desc', locale)],
-        ].map(([title, desc]) => (
-          <div className="discipline-pill" key={title}>
-            <span>{title}</span>
-            <strong>{desc}</strong>
-          </div>
-        ))}
+    <section className="gov-overview">
+      <div className="gov-kpi-grid">
+        <OverviewKpi icon={ClipboardList} label="Total Projects" value={stats.total} sub="Across all ministries" action="View all projects" onClick={() => onNavigate('projects')} />
+        <OverviewKpi icon={CheckCircle2} label="On Track" value={stats.on_track} sub={`${percent(stats.on_track, stats.total)}% of total`} tone="green" />
+        <OverviewKpi icon={AlertTriangle} label="At Risk" value={stats.at_risk} sub={`${percent(stats.at_risk, stats.total)}% of total`} tone="amber" />
+        <OverviewKpi icon={X} label="Off Track" value={stats.off_track} sub={`${percent(stats.off_track, stats.total)}% of total`} tone="red" />
+        <OverviewKpi icon={FileText} label="Pending Approvals" value={overview?.pending_approvals || 0} sub="Need action" tone="violet" />
+        <OverviewKpi icon={Archive} label="Evidence Gaps" value={evidenceGaps} sub="Require uploads" tone="blue" />
       </div>
 
-      <div className="cc-hero">
-        <div className="cc-health">
-          <div
-            className="health-ring"
-            style={{
-              '--score': `${stats.health_score * 3.6}deg`,
-              '--ring-color': stats.health_score >= 75 ? '#34d399' : stats.health_score >= 55 ? '#fbbf24' : '#f87171',
-            }}
-          >
-            <strong><AnimatedNumber value={stats.health_score} suffix="%" /></strong>
-          </div>
-          <div className="cc-health-copy">
-            <span>{t('portfolioHealth', locale)}</span>
-            <strong>
-              {stats.on_track}/{stats.total} {t('onTrack', locale)} · {stats.at_risk} {t('atRisk', locale)} · {stats.off_track} {t('offTrack', locale)}
-            </strong>
-            <small>
-              {trendDelta >= 0 ? '▲' : '▼'} {Math.abs(trendDelta)} pts vs last snapshot
-            </small>
-          </div>
-        </div>
-        <div className="metric-grid">
-          <Metric icon={ClipboardList} label={t('projects', locale)} value={stats.total} />
-          <Metric icon={Check} label={t('onTrack', locale)} value={stats.on_track} tone="green" sub={`${percent(stats.on_track, stats.total)}%`} />
-          <Metric icon={AlertTriangle} label={t('atRisk', locale)} value={stats.at_risk} tone="amber" sub={`${percent(stats.at_risk, stats.total)}%`} />
-          <Metric icon={X} label={t('offTrack', locale)} value={stats.off_track} tone="red" sub={`${percent(stats.off_track, stats.total)}%`} />
-        </div>
-      </div>
-
-      <div className="dashboard-grid">
-        <div className="card chart-card">
-          <h3><TrendingUp size={17} /> {t('portfolioTrend', locale)}</h3>
-          <ResponsiveContainer width="100%" height={170}>
-            <AreaChart data={trend}>
-              <defs>
-                <linearGradient id="health" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#4046e0" stopOpacity={0.24} />
-                  <stop offset="95%" stopColor="#4046e0" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid stroke="#eef1f6" vertical={false} />
-              <XAxis dataKey="name" tickLine={false} axisLine={false} tick={{ fontSize: 12, fill: '#6b7690' }} />
-              <YAxis hide domain={[0, 100]} />
-              <Tooltip contentStyle={{ borderRadius: 10, border: '1px solid #e4e9f0', boxShadow: '0 8px 24px rgba(16,24,40,.1)', fontSize: 13 }} />
-              <Area type="monotone" dataKey="value" stroke="#4046e0" fill="url(#health)" strokeWidth={2.5} />
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
-        <div className="card immediate-card">
-          <h3><Bell size={17} /> {t('needsAttention', locale)}</h3>
-          {attention.slice(0, 6).map(p => (
-            <p key={p._id}>
-              <span>{p.name}</span>
-              <span className={`status-badge ${p.status === 'At Risk' ? 'at-risk' : 'off-track'}`}>{p.status}</span>
-            </p>
-          ))}
-          {attention.length === 0 && <p className="empty-state" style={{ padding: 16 }}>{t('allOnTrack', locale)}</p>}
-        </div>
-        <div className="card chart-card">
-          <h3><Gauge size={17} /> Execution Heatmap</h3>
-          <table className="heatmap">
-            <thead>
-              <tr>
-                <th>{t('projects', locale)}</th>
-                {HEATMAP_KPIS.map(([, label]) => <th key={label}>{label}</th>)}
-              </tr>
-            </thead>
-            <tbody>
-              {heatRows.map(project => (
-                <tr key={project._id}>
-                  <td className="hm-label" title={project.name}>{project.name}</td>
-                  {HEATMAP_KPIS.map(([key]) => {
-                    const value = project.kpis?.[key];
-                    return <td className="hm-cell" key={key} style={heatColor(value)}>{value ?? '—'}</td>;
-                  })}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <div className="card">
-          <h3><Activity size={17} /> Portfolio Pulse</h3>
-          <div className="pulse-list">
-            {pulseRows.map(project => (
-              <div className="pulse-row" key={project._id}>
-                <div className="pulse-row-name">
-                  <strong>{project.name}</strong>
-                  <small>{project.ministry}</small>
-                </div>
-                <SparkBars project={project} />
-                <span className="pulse-score" style={{ color: scoreColor(project.health_score || 0) }}>{project.health_score}%</span>
-              </div>
+      <div className="gov-overview-main">
+        <div className="card gov-attention">
+          <h3><Bell size={17} /> Immediate Attention</h3>
+          <div className="attention-table">
+            {attention.slice(0, 5).map((p, index) => (
+              <button key={p._id} type="button" onClick={() => onNavigate('projects', p._id)}>
+                <span><strong>{p.name}</strong><small>{p.ministry}</small></span>
+                <em className={`status-badge ${p.status === 'At Risk' ? 'at-risk' : 'off-track'}`}>{p.status}</em>
+                <small>{index + 1} day{index ? 's' : ''}</small>
+              </button>
             ))}
+            {attention.length === 0 && <p className="ops-empty">All tracked projects are on track.</p>}
           </div>
         </div>
-        <InsightCard title={t('workingWell', locale)} icon={TrendingUp} tone="green" items={overview?.what_is_working || []} />
-        <InsightCard title={t('needsImprovement', locale)} icon={TrendingDown} tone="red" items={overview?.what_is_not_working || []} />
-        <Bottlenecks bottlenecks={overview?.bottlenecks || []} title={t('topBottlenecks', locale)} />
-        <div className="card">
-          <h3><Command size={17} /> {t('quickActions', locale)}</h3>
-          <p><button className="ghost-btn" onClick={() => onNavigate('projects')}>{t('openProjects', locale)}</button></p>
-          <p><button className="ghost-btn" onClick={() => onNavigate('scoreboard')}>{t('viewScoreboard', locale)}</button></p>
-          <p><button className="ghost-btn" onClick={() => onNavigate('evidence')}>{t('evidence', locale)}</button></p>
-          <p><button className="ghost-btn" onClick={() => onNavigate('decisions')}>{t('decisionQueue', locale)} ({overview?.decisions?.length || 0})</button></p>
-          <p><button className="ghost-btn" onClick={onExport}><Download size={15} /> {t('exportPortfolio', locale)}</button></p>
+
+        <div className="card gov-trend">
+          <h3><ClipboardList size={17} /> Portfolio Health Trend</h3>
+          <div className="trend-wrap">
+            <ResponsiveContainer width="100%" height={185}>
+              <AreaChart data={trend}>
+                <CartesianGrid stroke="#edf2fb" vertical={false} />
+                <XAxis dataKey="name" tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: '#64748b' }} />
+                <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: '#64748b' }} />
+                <Tooltip contentStyle={{ borderRadius: 10, border: '1px solid #dbe5f3', fontSize: 12 }} />
+                <Area type="monotone" dataKey="on_track" stroke="#2563eb" fill="#dbeafe" strokeWidth={2.5} />
+                <Area type="monotone" dataKey="at_risk" stroke="#f97316" fill="#ffedd5" strokeWidth={2.5} />
+                <Area type="monotone" dataKey="off_track" stroke="#ef4444" fill="#fee2e2" strokeWidth={2.5} />
+              </AreaChart>
+            </ResponsiveContainer>
+            <aside>
+              <h4>Current (this week)</h4>
+              <p><span className="legend-dot blue" /> On Track <b>{stats.on_track} ({percent(stats.on_track, stats.total)}%)</b></p>
+              <p><span className="legend-dot orange" /> At Risk <b>{stats.at_risk} ({percent(stats.at_risk, stats.total)}%)</b></p>
+              <p><span className="legend-dot red" /> Off Track <b>{stats.off_track} ({percent(stats.off_track, stats.total)}%)</b></p>
+              <hr />
+              <p>Total Projects <b>{stats.total}</b></p>
+            </aside>
+          </div>
         </div>
+      </div>
+
+      <div className="gov-insight-grid">
+        <InsightCard title="What Is Working" icon={TrendingUp} tone="blue" items={overview?.what_is_working || []} />
+        <InsightCard title="What Is Not Working" icon={TrendingDown} tone="red" items={overview?.what_is_not_working || []} />
+        <Bottlenecks bottlenecks={overview?.bottlenecks || []} title="Top Bottlenecks" />
+      </div>
+
+      <div className="card ai-decision-strip">
+        <div>
+          <Brain size={30} />
+          <div>
+            <h3>AI Decision Recommendation <span>Beta</span></h3>
+            <p>Intervene in the highest-risk approvals, evidence gaps, and blocked lead measures.</p>
+          </div>
+        </div>
+        <button className="primary-btn" onClick={() => onNavigate('decisions')}>Open Decision Brief <ChevronRight size={15} /></button>
       </div>
       {loading && <div className="loading">{t('refreshing', locale)}</div>}
     </section>
+  );
+}
+
+function OverviewKpi({ icon: Icon, label, value, sub, tone = 'blue', action, onClick }) {
+  return (
+    <div className={`card overview-kpi ${tone}`}>
+      <div className="overview-kpi-icon"><Icon size={25} /></div>
+      <div>
+        <span>{label}</span>
+        <strong><AnimatedNumber value={value} /></strong>
+        <small>{sub}</small>
+        {action && <button type="button" onClick={onClick}>{action} <ChevronRight size={13} /></button>}
+      </div>
+      <MiniSpark tone={tone} />
+    </div>
+  );
+}
+
+function MiniSpark({ tone = 'blue' }) {
+  const stroke = tone === 'red' ? '#ef4444' : tone === 'amber' ? '#f97316' : tone === 'green' ? '#16a34a' : '#2563eb';
+  return (
+    <svg className="mini-spark" viewBox="0 0 76 28" aria-hidden="true">
+      <polyline fill="none" stroke={stroke} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" points="2,20 14,15 24,18 34,10 45,17 58,12 72,15" />
+    </svg>
   );
 }
 
@@ -2391,15 +2421,21 @@ function Ministries({ ministries, projects }) {
   );
 }
 
-function Projects({ projects, allProjects = projects, ministries, api, reload, onOpen, onOpenMeetingToAction, locale }) {
-  const [wizardOpen, setWizardOpen] = useState(false);
+function Projects({ projects, allProjects = projects, ministries, permissions, session, api, reload, onOpen, onOpenMeetingToAction, locale }) {
+  const [workflowBuilderOpen, setWorkflowBuilderOpen] = useState(false);
   const [query, setQuery] = useState('');
-  const [sortBy, setSortBy] = useState('priority');
+  const [ministryFilter, setMinistryFilter] = useState('');
+  const [projectFilter, setProjectFilter] = useState('');
+  const [healthFilter, setHealthFilter] = useState('');
+  const canCreateProject = permissions?.can_create_project || isGlobalAdminUser(session?.user) || session?.user?.role === 'ministry_admin' || allProjects.some(project => project.permissions?.can_create_project);
   const filteredProjects = useMemo(() => {
     const text = query.trim().toLowerCase();
-    if (!text) return projects;
-    return projects.filter(project => {
+    return allProjects.filter(project => {
+      if (ministryFilter && project.ministry_id !== ministryFilter) return false;
+      if (projectFilter && project._id !== projectFilter) return false;
+      if (healthFilter && project.status !== healthFilter) return false;
       const wigText = (project.wigs || []).map(wig => `${wig.title} ${(wig.lead_measures || []).map(measure => measure.title).join(' ')}`).join(' ');
+      if (!text) return true;
       return [
         project.name,
         project.ministry,
@@ -2408,46 +2444,103 @@ function Projects({ projects, allProjects = projects, ministries, api, reload, o
         wigText
       ].join(' ').toLowerCase().includes(text);
     });
-  }, [projects, query]);
+  }, [allProjects, ministryFilter, projectFilter, healthFilter, query]);
 
   const sortedProjects = useMemo(() => {
     const list = [...filteredProjects];
-    if (sortBy === 'priority') list.sort((a, b) => ((b.priority ?? 5) - (a.priority ?? 5)) || ((a.health_score ?? 0) - (b.health_score ?? 0)));
-    else if (sortBy === 'health') list.sort((a, b) => (a.health_score ?? 0) - (b.health_score ?? 0));
-    else list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    list.sort((a, b) => ((b.priority ?? 5) - (a.priority ?? 5)) || ((a.health_score ?? 0) - (b.health_score ?? 0)));
     return list;
-  }, [filteredProjects, sortBy]);
+  }, [filteredProjects]);
+
+  if (workflowBuilderOpen) {
+    return (
+      <ProjectSetupWizard
+        ministries={ministries}
+        api={api}
+        reload={reload}
+        onClose={() => setWorkflowBuilderOpen(false)}
+      />
+    );
+  }
 
   return (
-    <section className="pf">
-      <div className="pf-head">
+    <section className="projects-page">
+      <div className="page-breadcrumbs">
+        <button type="button">Home</button>
+        <ChevronRight size={13} />
+        <span>Projects</span>
+      </div>
+      <div className="projects-page-head">
         <div>
-          <h2>{t('projects', locale)}</h2>
-          <span>{filteredProjects.length} of {allProjects.length} {t('projectsCount', locale)}</span>
+          <h2>Projects</h2>
+          <span>Portfolio view of all projects and their execution health.</span>
         </div>
-        <div className="pf-head-actions">
-          <label className="pf-search">
-            <Search size={15} />
-            <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search projects, WIGs, owners" />
-          </label>
-          <div className="pw-segment">
-            <button className={sortBy === 'priority' ? 'active' : ''} onClick={() => setSortBy('priority')}>Priority</button>
-            <button className={sortBy === 'health' ? 'active' : ''} onClick={() => setSortBy('health')}>Health</button>
-            <button className={sortBy === 'name' ? 'active' : ''} onClick={() => setSortBy('name')}>A–Z</button>
-          </div>
-          <button className="ghost-btn mta-btn" type="button" onClick={onOpenMeetingToAction}>
-            <ClipboardList size={15} /> {t('meetingToAction', locale)}
-          </button>
-          <button className="primary-btn" onClick={() => setWizardOpen(true)}><Plus size={15} /> {t('createProject', locale)}</button>
-        </div>
+        {canCreateProject ? (
+          <button className="primary-btn" onClick={() => setWorkflowBuilderOpen(true)}><Plus size={15} /> Create 4DX Workflow</button>
+        ) : (
+          <span className="read-only-note"><LockKeyhole size={14} /> Read-only portfolio view</span>
+        )}
       </div>
 
-      <div className="pf-grid">
-        {sortedProjects.map(project => <PortfolioCard key={project._id} project={project} onOpen={() => onOpen(project._id)} />)}
-        {sortedProjects.length === 0 && <p className="empty-state card">No projects match this search.</p>}
+      <div className="projects-filter-card card">
+        <label>
+          <span>Ministry</span>
+          <select value={ministryFilter} onChange={e => { setMinistryFilter(e.target.value); setProjectFilter(''); }}>
+            <option value="">All Ministries</option>
+            {ministries.map(ministry => <option key={ministry._id} value={ministry._id}>{ministry.name}</option>)}
+          </select>
+        </label>
+        <label>
+          <span>Project</span>
+          <select value={projectFilter} onChange={e => setProjectFilter(e.target.value)}>
+            <option value="">All Projects</option>
+            {allProjects.filter(project => !ministryFilter || project.ministry_id === ministryFilter).map(project => <option key={project._id} value={project._id}>{project.name}</option>)}
+          </select>
+        </label>
+        <label>
+          <span>WIG Health</span>
+          <select value={healthFilter} onChange={e => setHealthFilter(e.target.value)}>
+            <option value="">All</option>
+            <option>On Track</option>
+            <option>At Risk</option>
+            <option>Off Track</option>
+          </select>
+        </label>
+        <label className="projects-search">
+          <Search size={16} />
+          <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search projects..." />
+        </label>
       </div>
 
-      {wizardOpen && <ProjectSetupWizard ministries={ministries} api={api} reload={reload} onClose={() => setWizardOpen(false)} />}
+      <div className="projects-table-card card">
+        <table className="projects-table">
+          <thead>
+            <tr>
+              <th>Project</th>
+              <th>Execution</th>
+              <th>Owner</th>
+              <th>Current State</th>
+              <th>Target State</th>
+              <th>Deadline</th>
+              <th>Health</th>
+              <th>WIGs</th>
+              <th>Lead Measures</th>
+              <th>Evidence</th>
+              <th>Access</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sortedProjects.slice(0, 10).map(project => <PortfolioCard key={project._id} project={project} onOpen={() => onOpen(project._id)} />)}
+          </tbody>
+        </table>
+        {sortedProjects.length === 0 && <p className="empty-state">No projects match this search.</p>}
+        <div className="projects-table-footer">
+          <span>Showing 1 to {Math.min(10, sortedProjects.length)} of {sortedProjects.length} projects</span>
+          <div><button className="icon-btn"><ArrowLeft size={14} /></button><button className="active-page">1</button><button>2</button><button>3</button><button className="icon-btn"><ChevronRight size={14} /></button></div>
+          <span>Show <b>10</b> per page</span>
+        </div>
+      </div>
     </section>
   );
 }
@@ -2457,28 +2550,43 @@ function PortfolioCard({ project, onOpen }) {
   const wigs = (project.wigs || []).filter(wig => !wig.archived_at);
   const measures = countMeasures(project);
   const statusClass = project.status === 'On Track' ? 'on-track' : project.status === 'At Risk' ? 'at-risk' : 'off-track';
+  const milestones = project.milestones?.length ? project.milestones : [
+    { name: 'WIG', progress: project.kpis?.schedule || health },
+    { name: 'Lead Measures', progress: project.kpis?.lead_measures || health },
+    { name: 'Scoreboard', progress: project.kpis?.document_confidence || health },
+    { name: 'Cadence', progress: project.kpis?.cadence || health },
+    { name: 'Outcome', progress: project.kpis?.citizen_impact || health },
+  ];
+  const canEdit = project.permissions?.can_edit;
   return (
-    <button className="pf-card card" onClick={onOpen}>
-      <div className="pf-card-top">
-        <div className="pf-card-badges">
-          <PriorityChip value={project.priority} />
-          <span className={`status-badge ${statusClass}`}>{project.status}</span>
-        </div>
-        <span className="pf-card-health" style={{ color: scoreColor(health) }}>{health}%</span>
+    <tr>
+      <td>
+        <button className="project-cell" onClick={onOpen}>
+          <div className="project-avatar">{(project.name || 'P').slice(0, 1)}</div>
+          <span><strong>{project.name}</strong><small>{project.ministry}</small></span>
+        </button>
+      </td>
+      <td>
+        <div className="project-row-progress compact">
+        {milestones.slice(0, 5).map(item => (
+          <div className="project-progress-line" key={item.name}>
+            <span>{item.name}</span>
+            <div><em style={{ width: `${Math.max(0, Math.min(100, Number(item.progress) || 0))}%`, background: scoreColor(item.progress || 0) }} /></div>
+          </div>
+        ))}
       </div>
-      <h3>{project.name}</h3>
-      <p className="pf-card-meta">{project.ministry} · {project.owner || 'Owner not assigned'}</p>
-      <div className="pw-meter">
-        <div className="pw-meter-track"><em style={{ width: `${health}%`, background: scoreColor(health) }} /></div>
-      </div>
-      <div className="pf-card-foot">
-        <span>{wigs.length} WIGs</span>
-        <span>{measures} measures</span>
-        <span>{project.evidence_count || 0} docs</span>
-        <span className="pf-card-due">Due {project.due_date || '—'}</span>
-        <ChevronRight size={16} className="pf-card-chevron" />
-      </div>
-    </button>
+      </td>
+      <td><strong>{project.owner || 'Mission Director'}</strong><small>{project.ministry}</small></td>
+      <td><strong>{health}%</strong><small>{currentStateText(project)}</small></td>
+      <td><strong>{targetStateText(project)}</strong><small>by {deadlineText(project)}</small></td>
+      <td><strong>{deadlineText(project)}</strong><small>{daysUntil(project.due_date || project.deadline)}</small></td>
+      <td><span className={`status-badge ${statusClass}`}>{project.status}</span><strong>{health}%</strong></td>
+      <td>{wigs.length}</td>
+      <td>{measures}</td>
+      <td>{project.evidence_count || 0}</td>
+      <td><span className={`access-pill ${canEdit ? 'edit' : 'read'}`}>{canEdit ? 'Editable' : 'Read Only'}</span><small>{canEdit ? project.ministry : 'All Ministries'}</small></td>
+      <td><button className="ghost-btn" onClick={onOpen}>Open</button></td>
+    </tr>
   );
 }
 
@@ -2539,7 +2647,7 @@ function ProjectSetupWizard({ ministries, api, reload, onClose }) {
     target_state: '',
     from_value: 0,
     to_value: 100,
-    unit: '% completion',
+    unit: 'milestone score',
     deadline: '',
     owner: '',
     priority: '',
@@ -2552,7 +2660,7 @@ function ProjectSetupWizard({ ministries, api, reload, onClose }) {
     target_state: '',
     from_value: 0,
     to_value: 100,
-    unit: '%',
+    unit: 'tracking score',
     deadline: '',
     assigned_to: '',
     priority: '',
@@ -2567,9 +2675,12 @@ function ProjectSetupWizard({ ministries, api, reload, onClose }) {
 
   const wigs = useMemo(() => (project?.wigs || []).filter(wig => !wig.archived_at), [project]);
   const activeWig = wigs.find(wig => wig.id === activeWigId) || wigs[0] || null;
+  const activeMeasures = useMemo(() => (activeWig?.lead_measures || []).filter(measure => !measure.archived_at), [activeWig]);
+  const selectedMinistry = ministries.find(ministry => ministry._id === projectDraft.ministry_id);
+  const builderStep = !project ? 'project' : activeWig ? 'measures' : 'wigs';
 
   async function createProject(e) {
-    e.preventDefault();
+    e?.preventDefault?.();
     setSaving(true);
     try {
       const data = await api('/api/projects', {
@@ -2594,7 +2705,7 @@ function ProjectSetupWizard({ ministries, api, reload, onClose }) {
   }
 
   async function addWig(e) {
-    e.preventDefault();
+    e?.preventDefault?.();
     if (!project?._id) return;
     if (project.due_date && deadlineExceedsCap(wigDraft.deadline, project.due_date)) {
       return;
@@ -2628,7 +2739,7 @@ function ProjectSetupWizard({ ministries, api, reload, onClose }) {
   }
 
   async function addMeasure(e) {
-    e.preventDefault();
+    e?.preventDefault?.();
     if (!project?._id || !activeWig?.id) return;
     const maxDeadline = tightestDeadline(project.due_date, activeWig.deadline);
     if (maxDeadline && deadlineExceedsCap(measureDraft.deadline, maxDeadline)) {
@@ -2690,157 +2801,218 @@ function ProjectSetupWizard({ ministries, api, reload, onClose }) {
   const wizardSubmitLabel = step === 'project' ? (saving ? 'Creating…' : 'Create project') : step === 'wigs' ? (saving ? 'Adding…' : 'Add WIG') : (saving ? 'Adding…' : 'Add lead measure');
 
   return (
-    <EntityModal
-      title="Create 4DX workflow"
-      subtitle="Project → WIG → Lead measure"
-      onClose={onClose}
-      onSubmit={handleWizardSubmit}
-      submitLabel={wizardSubmitLabel}
-      busy={saving}
-    >
-      <div className="wizard-shell">
-        <WizardHierarchyStepper
-          step={step}
-          hasProject={Boolean(project)}
-          wigsCount={wigs.length}
-          onStep={target => setStep(target)}
-        />
-
-        {step === 'project' && (
-          <ProjectFormFields draft={projectDraft} setDraft={setProjectDraft} ministries={ministries} />
-        )}
-
-        {step === 'wigs' && project && (
-          <div className="wizard-layout">
-            <div>
-              {projectSummary()}
-              <WigFormFields
-                draft={wigDraft}
-                setDraft={setWigDraft}
-                inheritPriority={project.priority ?? 5}
-                projectBudget={wizardBudget.total || Number(project.budget_crore) || 0}
-                otherWigBudget={wizardOtherWigBudget}
-                projectDeadline={project.due_date || ''}
-              />
-              {wigs.length > 0 && (
-                <div className="wizard-inline-actions">
-                  <button type="button" className="ghost-btn" onClick={() => setStep('measures')}>Continue to lead measures →</button>
-                </div>
-              )}
-            </div>
-
-            <aside className="wizard-side">
-              <div className="wizard-panel-head">
-                <span>{wigs.length} added</span>
-                <h4>WIG list</h4>
-              </div>
-              <div className="wizard-list">
-                {wigs.length === 0 && <p className="wizard-empty">Added WIGs will appear here.</p>}
-                {wigs.map((wig, index) => (
-                  <button
-                    type="button"
-                    className={`wizard-row ${wig.id === activeWigId ? 'active' : ''}`}
-                    key={wig.id}
-                    onClick={() => { setActiveWigId(wig.id); setStep('measures'); }}
-                  >
-                    <span className="wizard-row-count">{String(index + 1).padStart(2, '0')}</span>
-                    <span className="wizard-row-main">
-                      <strong>{wig.title}</strong>
-                      <small>Current: {currentStateText(wig)} | Target: {targetStateText(wig)} | Deadline: {deadlineText(wig)}</small>
-                    </span>
-                    <ChevronRight size={16} />
-                  </button>
-                ))}
-              </div>
-            </aside>
-          </div>
-        )}
-
-        {step === 'measures' && project && (
-          <div className="wizard-layout">
-            <section className="wizard-panel">
-              <div className="wizard-panel-head">
-                <span>Lead Measures</span>
-                <h4>Add actions under the selected WIG</h4>
-              </div>
-              {projectSummary()}
-              <div className="wizard-accordion">
-                {wigs.length === 0 && <p className="wizard-empty">Add at least one WIG before assigning lead measures.</p>}
-                {wigs.map((wig, index) => {
-                  const expanded = (activeWig?.id || '') === wig.id;
-                  const measures = (wig.lead_measures || []).filter(measure => !measure.archived_at);
-                  return (
-                    <article className={`wizard-accordion-item ${expanded ? 'active' : ''}`} key={wig.id}>
-                      <button className="wizard-accordion-head" type="button" onClick={() => setActiveWigId(wig.id)}>
-                        <span>{String(index + 1).padStart(2, '0')}</span>
-                        <div>
-                          <strong>{wig.title}</strong>
-                          <small>{measures.length} lead measures | {wig.owner}</small>
-                        </div>
-                        <ChevronRight size={16} />
-                      </button>
-                      {expanded && (
-                        <div className="wizard-accordion-body">
-                          <MeasureFormFields
-                            draft={measureDraft}
-                            setDraft={setMeasureDraft}
-                            inheritPriority={wig.priority ?? project.priority ?? 5}
-                            wigBudget={wizardWigBudget.total || Number(wig.budget_allocated) || 0}
-                            otherMeasureBudget={wizardOtherMeasureBudget}
-                            projectDeadline={project.due_date || ''}
-                            wigDeadline={wig.deadline || ''}
-                          />
-
-                          <div className="measure-mini-list">
-                            {measures.length === 0 && <p className="wizard-empty">Lead measures added here will stay attached to this WIG.</p>}
-                            {measures.map(measure => (
-                              <div className="measure-mini-row" key={measure.id}>
-                                <Target size={15} />
-                                <span>
-                                  <strong>{measure.title}</strong>
-                                  <small>Current: {currentStateText(measure)} | Target: {targetStateText(measure)} | Deadline: {deadlineText(measure)}</small>
-                                </span>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                    </article>
-                  );
-                })}
-              </div>
-              <div className="wizard-actions">
-                <button className="ghost-btn" type="button" onClick={() => setStep('wigs')}>Add Another WIG</button>
-                <button className="primary-btn" type="button" onClick={finishSetup}>Finish Setup</button>
-              </div>
-            </section>
-
-            <aside className="wizard-side">
-              <div className="wizard-panel-head">
-                <span>Workflow summary</span>
-                <h4>{project.name}</h4>
-              </div>
-              <div className="wizard-list">
-                {wigs.map(wig => (
-                  <button
-                    key={wig.id}
-                    type="button"
-                    className={`wizard-row ${activeWig?.id === wig.id ? 'active' : ''}`}
-                    onClick={() => setActiveWigId(wig.id)}
-                  >
-                    <span className="wizard-row-count">{(wig.lead_measures || []).length}</span>
-                    <span className="wizard-row-main">
-                      <strong>{wig.title}</strong>
-                      <small>lead measures</small>
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </aside>
-          </div>
-        )}
+    <section className="workflow-builder-page">
+      <div className="page-breadcrumbs">
+        <button type="button" onClick={onClose}><ArrowLeft size={14} /> Projects</button>
+        <ChevronRight size={13} />
+        <span>Create 4DX Workflow</span>
       </div>
-    </EntityModal>
+
+      <div className="workflow-stepper card">
+        {[
+          ['project', 'Project', 'Define project basics'],
+          ['wigs', 'WIG / Milestone', 'Define WIGs and milestones'],
+          ['measures', 'Lead Measures', 'Define lead measures'],
+          ['review', 'Review', 'Review and confirm'],
+        ].map(([key, title, copy], index) => {
+          const active = key === builderStep || (key === 'review' && project && wigs.length && activeMeasures.length);
+          const complete = (key === 'project' && project) || (key === 'wigs' && wigs.length) || (key === 'measures' && activeMeasures.length);
+          return (
+            <React.Fragment key={key}>
+              {index > 0 && <div className={`workflow-step-line ${complete || active ? 'active' : ''}`} />}
+              <div className={`workflow-step ${active ? 'active' : ''} ${complete ? 'complete' : ''}`}>
+                <span>{complete ? <Check size={17} /> : index + 1}</span>
+                <div>
+                  <strong>{title}</strong>
+                  <small>{copy}</small>
+                </div>
+              </div>
+            </React.Fragment>
+          );
+        })}
+      </div>
+
+      <div className="workflow-builder-grid">
+        <form className="workflow-panel card" onSubmit={createProject}>
+          <div className="workflow-panel-title">
+            <span><ClipboardList size={18} /> 1. Project Details</span>
+            {project && <em>Saved</em>}
+          </div>
+          <label className="workflow-field">
+            <span>Project Name <b>*</b></span>
+            <input value={projectDraft.name} onChange={e => setProjectDraft({ ...projectDraft, name: e.target.value })} required placeholder="Rural Housing Mission" />
+          </label>
+          <label className="workflow-field">
+            <span>Ministry <b>*</b></span>
+            <select value={projectDraft.ministry_id} onChange={e => setProjectDraft({ ...projectDraft, ministry_id: e.target.value })} required>
+              {ministries.map(ministry => <option key={ministry._id} value={ministry._id}>{ministry.name}</option>)}
+            </select>
+          </label>
+          <label className="workflow-field">
+            <span>Department / Agency</span>
+            <input value={selectedMinistry?.name || ''} readOnly placeholder="Selected ministry" />
+          </label>
+          <label className="workflow-field">
+            <span>Owner <b>*</b></span>
+            <input value={projectDraft.owner} onChange={e => setProjectDraft({ ...projectDraft, owner: e.target.value })} required placeholder="Mission Director" />
+          </label>
+          <div className="workflow-two">
+            <label className="workflow-field">
+              <span>Start Date</span>
+              <input type="date" />
+            </label>
+            <label className="workflow-field">
+              <span>Target Completion Date <b>*</b></span>
+              <input type="date" value={projectDraft.due_date} onChange={e => setProjectDraft({ ...projectDraft, due_date: e.target.value })} required />
+            </label>
+          </div>
+          <label className="workflow-field">
+            <span>Current State <b>*</b></span>
+            <textarea value={projectDraft.current_state} onChange={e => setProjectDraft({ ...projectDraft, current_state: e.target.value })} required placeholder="Example: 10 houses constructed, water saving 10%, employment 250" />
+          </label>
+          <label className="workflow-field">
+            <span>Target State <b>*</b></span>
+            <textarea value={projectDraft.target_state} onChange={e => setProjectDraft({ ...projectDraft, target_state: e.target.value })} required placeholder="Example: 25 houses completed, water saving 45%, employment 1000" />
+          </label>
+          <div className="workflow-info"><Shield size={16} /> All projects are visible to all users. Edit access is role-based.</div>
+          <button className="sr-only-submit" type="submit">Save project</button>
+        </form>
+
+        <section className={`workflow-panel card workflow-wide-panel ${!project ? 'disabled' : ''}`}>
+          <div className="workflow-panel-title">
+            <span><Target size={18} /> 2. WIGs / Milestones ({wigs.length})</span>
+            <button type="button" className="ghost-btn" onClick={addWig} disabled={!project || saving}><Plus size={14} /> Add WIG</button>
+          </div>
+          <div className="workflow-split">
+            <div className="workflow-item-list">
+              {wigs.length === 0 && <p className="workflow-empty">Create the project, then add WIGs here.</p>}
+              {wigs.map((wig, index) => (
+                <button key={wig.id} type="button" className={`workflow-item ${activeWig?.id === wig.id ? 'active' : ''}`} onClick={() => { setActiveWigId(wig.id); setStep('measures'); }}>
+                  <span>{index + 1}</span>
+                  <div>
+                    <strong>{wig.title}</strong>
+                    <small>{currentStateText(wig)} → {targetStateText(wig)} by {deadlineText(wig)}</small>
+                  </div>
+                  <ChevronRight size={15} />
+                </button>
+              ))}
+            </div>
+            <form className="workflow-active-form" onSubmit={addWig}>
+              <div className="workflow-active-head">
+                <strong>Active WIG / Milestone</strong>
+                <button type="button" className="icon-btn" disabled><Archive size={14} /></button>
+              </div>
+              <label className="workflow-field">
+                <span>WIG / Milestone Title <b>*</b></span>
+                <input value={wigDraft.title} onChange={e => setWigDraft({ ...wigDraft, title: e.target.value })} required disabled={!project} maxLength={120} placeholder="Complete construction of 25 rural housing units" />
+              </label>
+              <label className="workflow-field">
+                <span>Current State <b>*</b></span>
+                <textarea value={wigDraft.current_state} onChange={e => setWigDraft({ ...wigDraft, current_state: e.target.value })} required disabled={!project} maxLength={250} placeholder="10 houses constructed" />
+                <small>What is the real current situation today? Use numbers and facts.</small>
+              </label>
+              <label className="workflow-field">
+                <span>Target State <b>*</b></span>
+                <textarea value={wigDraft.target_state} onChange={e => setWigDraft({ ...wigDraft, target_state: e.target.value })} required disabled={!project} maxLength={250} placeholder="25 houses completed" />
+              </label>
+              <div className="workflow-two">
+                <label className="workflow-field">
+                  <span>Deadline <b>*</b></span>
+                  <input type="date" value={wigDraft.deadline} max={project?.due_date || undefined} onChange={e => setWigDraft({ ...wigDraft, deadline: e.target.value })} required disabled={!project} />
+                </label>
+                <label className="workflow-field">
+                  <span>Owner <b>*</b></span>
+                  <input value={wigDraft.owner} onChange={e => setWigDraft({ ...wigDraft, owner: e.target.value })} required disabled={!project} placeholder="Vikram S." />
+                </label>
+              </div>
+              <label className="workflow-field">
+                <span>Update Frequency</span>
+                <select value={wigDraft.update_frequency} onChange={e => setWigDraft({ ...wigDraft, update_frequency: e.target.value })} disabled={!project}>
+                  {UPDATE_FREQUENCY_OPTIONS.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}
+                </select>
+              </label>
+              <div className="workflow-score-grid">
+                <label className="workflow-field"><span>Score starts at</span><input type="number" value={wigDraft.from_value} onChange={e => setWigDraft({ ...wigDraft, from_value: e.target.value })} disabled={!project} /></label>
+                <label className="workflow-field"><span>Score target</span><input type="number" value={wigDraft.to_value} onChange={e => setWigDraft({ ...wigDraft, to_value: e.target.value })} disabled={!project} /></label>
+                <label className="workflow-field"><span>Score label</span><input value={wigDraft.unit} onChange={e => setWigDraft({ ...wigDraft, unit: e.target.value })} disabled={!project} /></label>
+              </div>
+            </form>
+          </div>
+        </section>
+
+        <section className={`workflow-panel card workflow-wide-panel ${!activeWig ? 'disabled' : ''}`}>
+          <div className="workflow-panel-title">
+            <span><Gauge size={18} /> 3. Lead Measures ({activeMeasures.length})</span>
+            <button type="button" className="ghost-btn" onClick={addMeasure} disabled={!activeWig || saving}><Plus size={14} /> Add Lead Measure</button>
+          </div>
+          <div className="workflow-split">
+            <div className="workflow-item-list">
+              {!activeWig && <p className="workflow-empty">Select or add a WIG before adding lead measures.</p>}
+              {activeMeasures.map((measure, index) => (
+                <button key={measure.id} type="button" className="workflow-item">
+                  <span>{index + 1}</span>
+                  <div>
+                    <strong>{measure.title}</strong>
+                    <small>{currentStateText(measure)} → {targetStateText(measure)} by {deadlineText(measure)}</small>
+                  </div>
+                  <ChevronRight size={15} />
+                </button>
+              ))}
+            </div>
+            <form className="workflow-active-form" onSubmit={addMeasure}>
+              <div className="workflow-active-head">
+                <strong>Active Lead Measure</strong>
+                <button type="button" className="icon-btn" disabled><Archive size={14} /></button>
+              </div>
+              <label className="workflow-field">
+                <span>Lead Measure Title <b>*</b></span>
+                <input value={measureDraft.title} onChange={e => setMeasureDraft({ ...measureDraft, title: e.target.value })} required disabled={!activeWig} maxLength={120} placeholder="Move weekly verified progress" />
+              </label>
+              <label className="workflow-field">
+                <span>Current State <b>*</b></span>
+                <textarea value={measureDraft.current_state} onChange={e => setMeasureDraft({ ...measureDraft, current_state: e.target.value })} required disabled={!activeWig} maxLength={200} placeholder="29% verified" />
+                <small>What is the real current situation today? Use numbers and facts.</small>
+              </label>
+              <label className="workflow-field">
+                <span>Target State <b>*</b></span>
+                <textarea value={measureDraft.target_state} onChange={e => setMeasureDraft({ ...measureDraft, target_state: e.target.value })} required disabled={!activeWig} maxLength={200} placeholder="57% verified" />
+              </label>
+              <div className="workflow-two">
+                <label className="workflow-field">
+                  <span>Deadline <b>*</b></span>
+                  <input type="date" value={measureDraft.deadline} max={tightestDeadline(project?.due_date, activeWig?.deadline) || undefined} onChange={e => setMeasureDraft({ ...measureDraft, deadline: e.target.value })} required disabled={!activeWig} />
+                </label>
+                <label className="workflow-field">
+                  <span>Owner <b>*</b></span>
+                  <input value={measureDraft.assigned_to} onChange={e => setMeasureDraft({ ...measureDraft, assigned_to: e.target.value })} required disabled={!activeWig} placeholder="Ramesh M." />
+                </label>
+              </div>
+              <label className="workflow-field">
+                <span>Update Frequency</span>
+                <select value={measureDraft.update_frequency || 'weekly'} onChange={e => setMeasureDraft({ ...measureDraft, update_frequency: e.target.value })} disabled={!activeWig}>
+                  {UPDATE_FREQUENCY_OPTIONS.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}
+                </select>
+              </label>
+              <div className="workflow-score-grid">
+                <label className="workflow-field"><span>Score starts at</span><input type="number" value={measureDraft.from_value} onChange={e => setMeasureDraft({ ...measureDraft, from_value: e.target.value })} disabled={!activeWig} /></label>
+                <label className="workflow-field"><span>Score target</span><input type="number" value={measureDraft.to_value} onChange={e => setMeasureDraft({ ...measureDraft, to_value: e.target.value })} disabled={!activeWig} /></label>
+                <label className="workflow-field"><span>Score label</span><input value={measureDraft.unit} onChange={e => setMeasureDraft({ ...measureDraft, unit: e.target.value })} disabled={!activeWig} /></label>
+              </div>
+            </form>
+          </div>
+        </section>
+      </div>
+
+      <div className="workflow-builder-footer card">
+        <button type="button" className="ghost-btn" onClick={onClose}>Cancel</button>
+        <div>
+          <button type="button" className="ghost-btn" onClick={createProject} disabled={Boolean(project) || saving}><ClipboardList size={15} /> Save Draft</button>
+          <button type="button" className="ghost-btn" onClick={addWig} disabled={!project || saving}><Plus size={15} /> Add WIG</button>
+          <button type="button" className="ghost-btn" onClick={addMeasure} disabled={!activeWig || saving}><Plus size={15} /> Add Lead Measure</button>
+          <button type="button" className="primary-btn" onClick={finishSetup} disabled={!project || saving}>Review Workflow <ChevronRight size={16} /></button>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -2849,8 +3021,8 @@ function ProjectSetupWizard({ ministries, api, reload, onClose }) {
    Portfolio → Project → WIG → Lead Measure
    ───────────────────────────────────────────────────────────── */
 
-const WIG_BLANK = { title: '', current_state: '', target_state: '', from_value: 0, to_value: 100, unit: '% completion', deadline: '', owner: '', priority: '', update_frequency: 'weekly', budget_allocated: '' };
-const MEASURE_BLANK = { title: '', current_state: '', target_state: '', from_value: 0, to_value: 100, unit: '%', deadline: '', assigned_to: '', priority: '', budget_allocated: '' };
+const WIG_BLANK = { title: '', current_state: '', target_state: '', from_value: 0, to_value: 100, unit: 'milestone score', deadline: '', owner: '', priority: '', update_frequency: 'weekly', budget_allocated: '' };
+const MEASURE_BLANK = { title: '', current_state: '', target_state: '', from_value: 0, to_value: 100, unit: 'tracking score', deadline: '', assigned_to: '', priority: '', budget_allocated: '' };
 
 function truncateNavLabel(text, maxLen = 28) {
   const s = (text || '').trim();
@@ -3008,7 +3180,7 @@ function WigFormFields({ draft, setDraft, inheritPriority, projectBudget, otherW
   const deadlineError = projectDeadline && deadlineExceedsCap(draft.deadline, projectDeadline);
   return (
     <div className="entity-form">
-      <FormSection title="Goal definition" hint="What this WIG must achieve and by when.">
+      <FormSection title="Goal definition" hint="Use plain language for the real-world change. Numbers are optional here.">
         <label className="field">
           <span>Title</span>
           <input value={draft.title} onChange={e => setDraft({ ...draft, title: e.target.value })} required autoFocus placeholder="Wildly Important Goal title" />
@@ -3016,19 +3188,19 @@ function WigFormFields({ draft, setDraft, inheritPriority, projectBudget, otherW
         <div className="two-col">
           <label className="field">
             <span>Current state</span>
-            <textarea className="compact-textarea" value={draft.current_state} onChange={e => setDraft({ ...draft, current_state: e.target.value })} required placeholder="Where things stand today" />
+            <textarea className="compact-textarea" value={draft.current_state} onChange={e => setDraft({ ...draft, current_state: e.target.value })} required placeholder="Example: 10 houses constructed, water saving at 10%, 250 people employed" />
           </label>
           <label className="field">
             <span>Target state</span>
-            <textarea className="compact-textarea" value={draft.target_state} onChange={e => setDraft({ ...draft, target_state: e.target.value })} required placeholder="What success looks like" />
+            <textarea className="compact-textarea" value={draft.target_state} onChange={e => setDraft({ ...draft, target_state: e.target.value })} required placeholder="Example: 25 houses completed, water saving at 45%, employment for 1,000 people" />
           </label>
         </div>
       </FormSection>
-      <FormSection title="Metrics & timeline" hint="Track progress with a measurable from → to range.">
+      <FormSection title="Tracking score & timeline" hint="Optional scoring scale for charts and health. The real current/target state is above.">
         <div className="pw-form-grid">
-          <label className="field"><span>From</span><input type="number" value={draft.from_value} onChange={e => setDraft({ ...draft, from_value: e.target.value })} /></label>
-          <label className="field"><span>To</span><input type="number" value={draft.to_value} onChange={e => setDraft({ ...draft, to_value: e.target.value })} required /></label>
-          <label className="field"><span>Unit</span><input value={draft.unit} onChange={e => setDraft({ ...draft, unit: e.target.value })} required /></label>
+          <label className="field"><span>Score starts at</span><input type="number" value={draft.from_value} onChange={e => setDraft({ ...draft, from_value: e.target.value })} /></label>
+          <label className="field"><span>Score target</span><input type="number" value={draft.to_value} onChange={e => setDraft({ ...draft, to_value: e.target.value })} required /></label>
+          <label className="field"><span>Score label</span><input value={draft.unit} onChange={e => setDraft({ ...draft, unit: e.target.value })} required placeholder="milestone score, houses, %, jobs" /></label>
           <label className="field"><span>Deadline</span><input type="date" value={draft.deadline} max={projectDeadline || undefined} onChange={e => setDraft({ ...draft, deadline: e.target.value })} required /><FieldHint hint={projectDeadline ? `Must be on or before project deadline: ${projectDeadline}` : null} error={deadlineError ? `Cannot exceed project deadline (${projectDeadline})` : null} /></label>
         </div>
       </FormSection>
@@ -3077,7 +3249,7 @@ function MeasureFormFields({ draft, setDraft, inheritPriority, wigBudget, otherM
     : null;
   return (
     <div className="entity-form">
-      <FormSection title="Lead measure" hint="A predictive action that drives the WIG outcome.">
+      <FormSection title="Lead measure" hint="Describe the action in real-world terms first, then add a tracking score below.">
         <label className="field">
           <span>Title</span>
           <input value={draft.title} onChange={e => setDraft({ ...draft, title: e.target.value })} required autoFocus placeholder="Weekly field verification, approvals cleared…" />
@@ -3085,19 +3257,19 @@ function MeasureFormFields({ draft, setDraft, inheritPriority, wigBudget, otherM
         <div className="two-col">
           <label className="field">
             <span>Current state</span>
-            <textarea className="compact-textarea" value={draft.current_state} onChange={e => setDraft({ ...draft, current_state: e.target.value })} required />
+            <textarea className="compact-textarea" value={draft.current_state} onChange={e => setDraft({ ...draft, current_state: e.target.value })} required placeholder="Example: 10 houses verified, 250 jobs created, 4 approvals cleared" />
           </label>
           <label className="field">
             <span>Target state</span>
-            <textarea className="compact-textarea" value={draft.target_state} onChange={e => setDraft({ ...draft, target_state: e.target.value })} required />
+            <textarea className="compact-textarea" value={draft.target_state} onChange={e => setDraft({ ...draft, target_state: e.target.value })} required placeholder="Example: 25 houses verified, 1,000 jobs created, all 9 approvals cleared" />
           </label>
         </div>
       </FormSection>
-      <FormSection title="Metrics & timeline">
+      <FormSection title="Tracking score & timeline" hint="Used for progress bars and health scoring. Current/target text above can be any format.">
         <div className="pw-form-grid">
-          <label className="field"><span>From</span><input type="number" value={draft.from_value} onChange={e => setDraft({ ...draft, from_value: e.target.value })} /></label>
-          <label className="field"><span>To</span><input type="number" value={draft.to_value} onChange={e => setDraft({ ...draft, to_value: e.target.value })} required /></label>
-          <label className="field"><span>Unit</span><input value={draft.unit} onChange={e => setDraft({ ...draft, unit: e.target.value })} required /></label>
+          <label className="field"><span>Score starts at</span><input type="number" value={draft.from_value} onChange={e => setDraft({ ...draft, from_value: e.target.value })} /></label>
+          <label className="field"><span>Score target</span><input type="number" value={draft.to_value} onChange={e => setDraft({ ...draft, to_value: e.target.value })} required /></label>
+          <label className="field"><span>Score label</span><input value={draft.unit} onChange={e => setDraft({ ...draft, unit: e.target.value })} required placeholder="tracking score, houses, %, jobs" /></label>
           <label className="field"><span>Deadline</span><input type="date" value={draft.deadline} max={maxDeadline || undefined} onChange={e => setDraft({ ...draft, deadline: e.target.value })} required /><FieldHint hint={deadlineHint} error={deadlineError ? `Cannot exceed ${maxDeadline}` : null} /></label>
         </div>
       </FormSection>
@@ -3157,15 +3329,15 @@ function ProjectFormFields({ draft, setDraft, ministries }) {
           </label>
         </div>
       </FormSection>
-      <FormSection title="Execution scope" hint="Define the starting point and the outcome you are accountable for.">
+      <FormSection title="Execution scope" hint="Current and target can be descriptive, numeric, percentage-based, or outcome-based.">
         <div className="two-col">
           <label className="field">
             <span>Current state</span>
-            <textarea className="compact-textarea" value={draft.current_state} onChange={e => setDraft({ ...draft, current_state: e.target.value })} required placeholder="Baseline today" />
+            <textarea className="compact-textarea" value={draft.current_state} onChange={e => setDraft({ ...draft, current_state: e.target.value })} required placeholder="Example: 10 houses constructed, water saving at 10%, employment at 250 people" />
           </label>
           <label className="field">
             <span>Target state</span>
-            <textarea className="compact-textarea" value={draft.target_state} onChange={e => setDraft({ ...draft, target_state: e.target.value })} required placeholder="Success definition" />
+            <textarea className="compact-textarea" value={draft.target_state} onChange={e => setDraft({ ...draft, target_state: e.target.value })} required placeholder="Example: 25 houses completed, water saving at 45%, employment for 1,000 people" />
           </label>
         </div>
       </FormSection>
@@ -3185,6 +3357,43 @@ function ProjectFormFields({ draft, setDraft, ministries }) {
   );
 }
 
+function AutoInsightCard({ insight, scope, onOpen, onRefresh }) {
+  const label = scope === 'measure' ? 'Lead Measure AI Insight' : scope === 'wig' ? 'WIG AI Insight' : 'Project AI Insight';
+  const summary = insight?.result?.summary || '';
+  const risks = insight?.result?.risks || [];
+  const highlights = insight?.result?.highlights || [];
+  const firstRisk = risks[0];
+  return (
+    <section className="auto-insight card">
+      <div className="auto-insight-head">
+        <span><Brain size={15} /> {label}</span>
+        <div>
+          <button className="icon-btn" type="button" onClick={onRefresh} title="Refresh AI insight"><RefreshCw size={14} className={insight?.loading ? 'spin' : ''} /></button>
+          <button className="ghost-btn" type="button" onClick={onOpen}>Ask AI</button>
+        </div>
+      </div>
+      {insight?.loading && <p className="auto-insight-muted"><Loader2 size={15} className="spin" /> Analyzing execution context…</p>}
+      {!insight?.loading && insight?.error && <p className="ai-error">{insight.error}</p>}
+      {!insight?.loading && !insight?.error && (
+        <div className="auto-insight-grid">
+          <div>
+            <b>Summary</b>
+            <p>{summary || 'AI insight will appear after this workspace finishes loading.'}</p>
+          </div>
+          <div>
+            <b>Recommended next action</b>
+            <p>{firstRisk?.reason || highlights[0] || 'Continue weekly cadence and keep evidence current.'}</p>
+          </div>
+          <div>
+            <b>Risk signal</b>
+            <p>{firstRisk?.title || 'No major risk signal detected yet.'}</p>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ProjectWorkspace({ projectId, initialWigId = null, initialMeasureId = null, projects, api, reload, session, notify, onExit, locale = 'en', onOpenMeetingToAction, mtaRefreshKey = 0 }) {
   const [bundle, setBundle] = useState(null);
   const [wigId, setWigId] = useState(initialWigId);
@@ -3193,6 +3402,7 @@ function ProjectWorkspace({ projectId, initialWigId = null, initialMeasureId = n
   const [activitySort, setActivitySort] = useState('latest');
   const [modal, setModal] = useState(null);
   const [insightModal, setInsightModal] = useState(null);
+  const [autoInsight, setAutoInsight] = useState({ key: '', loading: false, result: null, error: '' });
   const [busy, setBusy] = useState(false);
   const [quickEdit, setQuickEdit] = useState(null);
   const [wigDraft, setWigDraft] = useState(WIG_BLANK);
@@ -3204,7 +3414,7 @@ function ProjectWorkspace({ projectId, initialWigId = null, initialMeasureId = n
 
   const fallback = projects.find(p => p._id === projectId) || null;
   const project = bundle?.project || fallback;
-  const canEdit = bundle?.permissions?.can_edit !== false;
+  const canEdit = (bundle?.permissions || project?.permissions)?.can_edit === true;
   const wigs = useMemo(
     () => (project?.wigs || []).filter(w => !w.archived_at).sort((a, b) => (b.priority ?? 5) - (a.priority ?? 5)),
     [project],
@@ -3219,6 +3429,23 @@ function ProjectWorkspace({ projectId, initialWigId = null, initialMeasureId = n
 
   function openContextualInsight(scope) {
     setInsightModal({ scope });
+  }
+
+  function insightPath(scope = level) {
+    if (scope === 'measure' && wig?.id && measure?.id) return `/api/ai/insight/measure/${projectId}/${wig.id}/${measure.id}`;
+    if (scope === 'wig' && wig?.id) return `/api/ai/insight/wig/${projectId}/${wig.id}`;
+    return `/api/ai/insight/project/${projectId}`;
+  }
+
+  async function loadAutoInsight(scope = level) {
+    const key = `${scope}:${projectId}:${wig?.id || ''}:${measure?.id || ''}`;
+    setAutoInsight({ key, loading: true, result: null, error: '' });
+    try {
+      const result = await api(insightPath(scope), { method: 'POST', body: JSON.stringify({}) });
+      setAutoInsight({ key, loading: false, result, error: '' });
+    } catch (err) {
+      setAutoInsight({ key, loading: false, result: null, error: err.message || 'AI insight unavailable' });
+    }
   }
 
   function navigateToRiskSource(source) {
@@ -3264,6 +3491,12 @@ function ProjectWorkspace({ projectId, initialWigId = null, initialMeasureId = n
       setTab('activity');
     }
   }, [measureId]);
+
+  useEffect(() => {
+    if (!project) return;
+    loadAutoInsight(level);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, wig?.id, measure?.id, level]);
 
   async function loadBundle() {
     try {
@@ -3603,6 +3836,22 @@ function ProjectWorkspace({ projectId, initialWigId = null, initialMeasureId = n
     exit: { opacity: 0, x: -26 },
     transition: { duration: 0.22, ease: [0.32, 0.72, 0, 1] },
   };
+  const activeWigForPanel = wig || wigs[0] || null;
+  const activePanelMeasures = (activeWigForPanel?.lead_measures || []).filter(item => !item.archived_at);
+  const allMeasures = wigs.flatMap(item => (item.lead_measures || []).filter(measureItem => !measureItem.archived_at).map(measureItem => ({ ...measureItem, wig_id: item.id, wig_title: item.title })));
+  const docsByMeasure = new Set((bundle?.documents || []).map(doc => doc.measure_id).filter(Boolean));
+  const missingEvidence = allMeasures.filter(item => !docsByMeasure.has(item.id));
+  const overdueMeasures = allMeasures.filter(item => isEntityOverdue(item));
+  const measurePct = measure ? progressPercent(measure.from_value, measure.to_value, measure.current_value ?? measure.from_value) : 0;
+  const measurePendingApprovals = measureApprovals.filter(item => item.status === 'Pending');
+  const measureApprovedApprovals = measureApprovals.filter(item => item.status !== 'Pending');
+  const nextMeasureAction = measurePendingApprovals.length
+    ? 'Approve pending authority action or request additional evidence.'
+    : missingEvidence.some(item => item.id === measure?.id)
+      ? 'Attach evidence before the next review cycle.'
+      : measurePct < 70
+        ? 'Update progress and capture the blocker owner.'
+        : 'Keep cadence active and prepare closure evidence.';
 
   return (
     <section className="pw">
@@ -3625,6 +3874,357 @@ function ProjectWorkspace({ projectId, initialWigId = null, initialMeasureId = n
         </div>
       </div>
 
+      <AnimatePresence mode="wait">
+        {level !== 'measure' && (
+          <motion.div key={`operations-${level}-${activeWigForPanel?.id || 'project'}`} {...slide}>
+            <div className="workspace-title-row">
+              <div className="page-breadcrumbs">
+                <button type="button" onClick={goProjectHome}>Projects</button>
+                <ChevronRight size={13} />
+                <button type="button">{project.ministry}</button>
+                <ChevronRight size={13} />
+                <span>{project.name}</span>
+              </div>
+              <h1>Project Workspace</h1>
+              <p>Real-time execution view for project, WIGs, lead measures and decisions.</p>
+            </div>
+            <section className="ops-hero card">
+              <div className="ops-project-icon">
+                <Building2 size={24} />
+              </div>
+              <div className="ops-project-title">
+                <span>{level === 'wig' ? 'Selected WIG' : 'Project'}</span>
+                <h1>{project.name}</h1>
+                <p>{project.ministry} Department · {project.owner || 'Mission Director'}</p>
+              </div>
+              <div className="ops-metric">
+                <span>Current</span>
+                <strong>{currentStateText(level === 'wig' ? activeWigForPanel : project)}</strong>
+              </div>
+              <div className="ops-metric">
+                <span>Target</span>
+                <strong>{targetStateText(level === 'wig' ? activeWigForPanel : project)}</strong>
+              </div>
+              <div className="ops-metric">
+                <span>Deadline</span>
+                <strong>{deadlineText(level === 'wig' ? activeWigForPanel : project)}</strong>
+              </div>
+              <div className="ops-health">
+                <span>Health</span>
+                <strong>{level === 'wig' ? progressPercent(activeWigForPanel?.from_value, activeWigForPanel?.to_value, activeWigForPanel?.current_value ?? activeWigForPanel?.from_value) : project.health_score}%</strong>
+                <small>{level === 'wig' ? 'WIG execution' : project.status}</small>
+              </div>
+              <button className="ops-next-action" type="button" onClick={() => openContextualInsight(level === 'wig' ? 'wig' : 'project')}>
+                <Sparkles size={16} />
+                <span>Recommended Next Action</span>
+                <strong>{autoInsight?.result?.recommendations?.[0] || autoInsight?.result?.summary || 'Review blocked lead measures and evidence gaps.'}</strong>
+                <ChevronRight size={18} />
+              </button>
+            </section>
+
+            <section className="ops-grid">
+              <aside className="ops-card card">
+                <div className="ops-card-head">
+                  <div>
+                    <h2>WIGs / Milestones</h2>
+                    <p>{wigs.length} active milestones</p>
+                  </div>
+                  {canEdit && <button className="ghost-btn" onClick={openAddWig}><Plus size={14} /> Add WIG</button>}
+                </div>
+                <div className="ops-wig-list">
+                  {wigs.map((item, index) => {
+                    const selected = activeWigForPanel?.id === item.id;
+                    const itemMeasures = (item.lead_measures || []).filter(measureItem => !measureItem.archived_at);
+                    return (
+                      <button className={`ops-wig-item ${selected ? 'active' : ''}`} type="button" key={item.id} onClick={() => setWigId(item.id)}>
+                        <span className={`ops-status-dot ${measureState(item)}`} />
+                        <div>
+                          <strong>{item.title}</strong>
+                          <small>{currentStateText(item)} → {targetStateText(item)} by {deadlineText(item)}</small>
+                        </div>
+                        <em>{itemMeasures.length}<small>Lead Measures</small></em>
+                        <ChevronRight size={16} />
+                      </button>
+                    );
+                  })}
+                  {wigs.length === 0 && <p className="ops-empty">No WIGs yet.</p>}
+                </div>
+                <button className="ops-link" type="button" onClick={goProjectHome}>View all WIGs</button>
+              </aside>
+
+              <main className="ops-card card">
+                <div className="ops-card-head">
+                  <div>
+                    <span>Selected WIG</span>
+                    <h2>{activeWigForPanel?.title || 'Select a WIG'}</h2>
+                    <p>{activeWigForPanel ? `${currentStateText(activeWigForPanel)} → ${targetStateText(activeWigForPanel)} by ${deadlineText(activeWigForPanel)}` : 'Choose a milestone from the left.'}</p>
+                  </div>
+                  {canEdit && activeWigForPanel && (
+                    <div className="ops-actions">
+                      <button className="ghost-btn" onClick={() => { setWigId(activeWigForPanel.id); openEditWig(); }}><Pencil size={14} /> WIG Details</button>
+                      <button className="primary-btn" onClick={() => { setWigId(activeWigForPanel.id); openAddMeasure(); }}><Plus size={14} /> Add Lead Measure</button>
+                    </div>
+                  )}
+                </div>
+                {activeWigForPanel && (
+                  <div className="wig-state-pair">
+                    <div>
+                      <span>Current State (Real World)</span>
+                      <strong>{currentStateText(activeWigForPanel)}</strong>
+                    </div>
+                    <div>
+                      <span>Target State (Real World)</span>
+                      <strong>{targetStateText(activeWigForPanel)}</strong>
+                    </div>
+                  </div>
+                )}
+                <div className="ops-lead-timeline">
+                  {activePanelMeasures.map((item, index) => {
+                    const pct = progressPercent(item.from_value, item.to_value, item.current_value ?? item.from_value);
+                    const missingDoc = !docsByMeasure.has(item.id);
+                    return (
+                      <article className="ops-lead-row" key={item.id}>
+                        <span className="ops-step">{index + 1}</span>
+                        <button type="button" className="ops-lead-main" onClick={() => { setWigId(activeWigForPanel.id); setMeasureId(item.id); }}>
+                          <div>
+                            <strong>{item.title}</strong>
+                            <small>{item.assigned_to?.join(', ') || 'Owner pending'}</small>
+                          </div>
+                          <HealthBadge state={measureState(item)} />
+                          <span><b>Current</b>{currentStateText(item)}</span>
+                          <span><b>Target</b>{targetStateText(item)}</span>
+                          <span><b>Deadline</b>{deadlineText(item)}</span>
+                        </button>
+                        <div className="ops-progress">
+                          <div><em style={{ width: `${pct}%`, background: scoreColor(pct) }} /></div>
+                          <small>{pct}%</small>
+                        </div>
+                        <div className="ops-row-actions">
+                          {missingDoc && <button className="ghost-btn" type="button" onClick={() => { setWigId(activeWigForPanel.id); setMeasureId(item.id); setModal('evidence'); }}><Paperclip size={13} /> Evidence</button>}
+                          {canEdit && <button className="ghost-btn" type="button" onClick={() => { setWigId(activeWigForPanel.id); setMeasureId(item.id); openApproval(); }}><Send size={13} /> Approval</button>}
+                          <button className="primary-btn compact" type="button" onClick={() => { setWigId(activeWigForPanel.id); setMeasureId(item.id); }}>Open</button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                  {activePanelMeasures.length === 0 && <p className="ops-empty">No lead measures under this WIG yet.</p>}
+                </div>
+              </main>
+
+              <aside className="ops-card card">
+                <div className="ops-card-head compact">
+                  <div>
+                    <h2>Open Items</h2>
+                    <p>Actionable blockers</p>
+                  </div>
+                </div>
+                <div className="ops-open-stack">
+                  <div className="ops-open-item approval">
+                    <span><FileText size={18} /> Pending Approvals</span>
+                    <strong>{pendingApprovals.length}</strong>
+                    {(pendingApprovals || []).slice(0, 2).map(item => <small key={item._id}>{item.title}</small>)}
+                  </div>
+                  <div className="ops-open-item evidence">
+                    <span><Paperclip size={18} /> Missing Evidence</span>
+                    <strong>{missingEvidence.length}</strong>
+                    {missingEvidence.slice(0, 3).map(item => <small key={item.id}>{item.title}</small>)}
+                  </div>
+                  <div className="ops-open-item overdue">
+                    <span><AlertTriangle size={18} /> Overdue Updates</span>
+                    <strong>{overdueMeasures.length}</strong>
+                    {overdueMeasures.slice(0, 3).map(item => <small key={item.id}>{item.title}</small>)}
+                  </div>
+                  <button className="ops-view-all" type="button" onClick={() => openContextualInsight('project')}>View AI Recommendation <ChevronRight size={15} /></button>
+                </div>
+              </aside>
+            </section>
+            <section className="workspace-bottom card">
+              <div className="workspace-tabs">
+                <button className="active">Timeline</button>
+                <button>Evidence ({bundle?.documents?.length || 0})</button>
+                <button>Approvals ({bundle?.approvals?.length || 0})</button>
+                <button>Decisions ({bundle?.decisions?.length || 0})</button>
+              </div>
+              <div className="workspace-bottom-grid">
+                <div className="workspace-timeline-list">
+                  {(bundle?.activity || []).slice(0, 3).map((item, index) => (
+                    <div key={`${item.type}-${index}`}>
+                      <span className={`timeline-dot ${index === 0 ? 'red' : index === 1 ? 'orange' : 'blue'}`} />
+                      <small>{item.created_at ? formatDate(item.created_at, locale) : 'Recent'}</small>
+                      <strong>{item.title || item.action || item.type}</strong>
+                      <p>{item.comment || item.summary || item.description || 'Execution update recorded.'}</p>
+                    </div>
+                  ))}
+                  {!(bundle?.activity || []).length && <p className="ops-empty">Timeline events will appear as updates are posted.</p>}
+                </div>
+                <AutoInsightCard
+                  insight={autoInsight}
+                  scope={level === 'wig' ? 'wig' : 'project'}
+                  onOpen={() => openContextualInsight(level === 'wig' ? 'wig' : 'project')}
+                  onRefresh={() => loadAutoInsight(level === 'wig' ? 'wig' : 'project')}
+                  locale={locale}
+                />
+              </div>
+            </section>
+          </motion.div>
+        )}
+
+        {level === 'measure' && (
+          <motion.div key={`measure-cockpit-${measure.id}`} {...slide}>
+            <section className="lm-header card">
+              <div className="lm-title-block">
+                <div className="lm-breadcrumb">Projects <ChevronRight size={12} /> {project.name} <ChevronRight size={12} /> Lead Measure</div>
+                <h1>{measure.title}</h1>
+                <div className="lm-tags">
+                  <span>Lead Measure</span>
+                  <span>ID: {measure.id?.slice(0, 8) || 'LM'}</span>
+                  <span>Owner: {measure.assigned_to?.join(', ') || 'Owner pending'}</span>
+                </div>
+              </div>
+              <div className="lm-actions">
+                {canEdit && <button className="ghost-btn" onClick={() => { setEvidenceDraft({ title: '', document_type: 'Progress Note', content: '' }); setModal('evidence'); }}><Paperclip size={15} /> Add Evidence</button>}
+                {canEdit && <button className="primary-btn" onClick={openApproval}><Send size={15} /> Request New Approval</button>}
+                {canEdit && <button className="icon-btn" onClick={openEditMeasure}><Pencil size={15} /></button>}
+              </div>
+            </section>
+
+            <section className="lm-summary-grid">
+              <div className="lm-summary-card card"><span>Project Name</span><strong>{project.name}</strong><small>{project.ministry} Department</small></div>
+              <div className="lm-summary-card card"><span>WIG / Milestone</span><strong>{wig.title}</strong><small>{currentStateText(wig)} → {targetStateText(wig)}</small></div>
+              <div className="lm-summary-card card blue"><span>Current</span><strong>{currentStateText(measure)}</strong><small>{measure.current_value ?? measure.from_value} / {measure.to_value} {measure.unit}</small></div>
+              <div className="lm-summary-card card"><span>Target</span><strong>{targetStateText(measure)}</strong><small>By {deadlineText(measure)}</small></div>
+              <div className="lm-summary-card card"><span>Deadline</span><strong>{deadlineText(measure)}</strong><small>{isEntityOverdue(measure) ? 'Overdue' : 'Active timeline'}</small></div>
+              <div className="lm-summary-card card"><span>Health</span><strong><HealthBadge state={measureState(measure)} /></strong><small>{measurePct}% complete</small></div>
+            </section>
+
+            <AutoInsightCard
+              insight={autoInsight}
+              scope="measure"
+              onOpen={() => openContextualInsight('measure')}
+              onRefresh={() => loadAutoInsight('measure')}
+              locale={locale}
+            />
+
+            <section className="lm-main-grid">
+              <div className="card approval-pipeline">
+                <div className="ops-card-head">
+                  <div>
+                    <h2>Approval Pipeline</h2>
+                    <p>Track and act on approvals required to reach the target.</p>
+                  </div>
+                  {canEdit && <button className="ghost-btn" onClick={openApproval}>Request Approval</button>}
+                </div>
+                <div className="pipeline-stage requested">
+                  <span><Send size={17} /></span>
+                  <div>
+                    <h3>Requested</h3>
+                    <small>{measurePendingApprovals.length} pending</small>
+                  </div>
+                  <div className="pipeline-list">
+                    {measurePendingApprovals.map(item => (
+                      <article key={item._id} className="pipeline-item pending" id={`approval-${item._id}`}>
+                        <div>
+                          <strong>{item.title}</strong>
+                          <p>{item.summary || 'Approval note pending.'}</p>
+                          <small>Requested by {item.requested_by} · Due {item.due_date || 'not set'}</small>
+                        </div>
+                        {canEdit && (
+                          <div className="pipeline-actions">
+                            <button className="ghost-btn" onClick={() => updateApprovalStatus(item._id, 'Approved')}><Check size={14} /> Approve</button>
+                            <button className="ghost-btn danger" onClick={() => updateApprovalStatus(item._id, 'Rejected')}><ArrowLeft size={14} /> Return</button>
+                          </div>
+                        )}
+                      </article>
+                    ))}
+                    {measurePendingApprovals.length === 0 && <p className="ops-empty">No approval is pending for this lead measure.</p>}
+                  </div>
+                </div>
+                <div className="pipeline-stage approved">
+                  <span><Check size={17} /></span>
+                  <div>
+                    <h3>Approved / Closed</h3>
+                    <small>{measureApprovedApprovals.length} completed</small>
+                  </div>
+                  <div className="pipeline-list">
+                    {measureApprovedApprovals.slice(0, 3).map(item => (
+                      <article key={item._id} className="pipeline-item approved">
+                        <strong>{item.title}</strong>
+                        <small>{item.status} · {item.updated_at ? formatEventDate(item.updated_at) : 'updated'}</small>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <aside className="lm-side-stack">
+                <div className="card impact-card">
+                  <h2>What this approval affects</h2>
+                  <div className="impact-meter"><div><em style={{ width: `${measurePct}%` }} /></div><strong>{measurePct}%</strong></div>
+                  <p>{nextMeasureAction}</p>
+                </div>
+                <div className="card evidence-side">
+                  <div className="ops-card-head compact">
+                    <div>
+                      <h2>Linked Evidence ({measureDocs.length})</h2>
+                      <p>AI summaries from attached documents.</p>
+                    </div>
+                  </div>
+                  {measureDocs.slice(0, 3).map(doc => <EvidenceSummaryCard key={doc._id} doc={doc} />)}
+                  {measureDocs.length === 0 && <p className="ops-empty">No evidence attached yet.</p>}
+                  {canEdit && <button className="ghost-btn full" onClick={() => { setEvidenceDraft({ title: '', document_type: 'Progress Note', content: '' }); setModal('evidence'); }}>Attach Evidence</button>}
+                </div>
+              </aside>
+            </section>
+
+            {canEdit && (
+              <form className="pw-composer card" onSubmit={submitComposer}>
+                <div className="pw-segment">
+                  <button type="button" className={composer.mode === 'progress' ? 'active' : ''} onClick={() => setComposer({ ...composer, mode: 'progress' })}><TrendingUp size={14} /> Progress</button>
+                  <button type="button" className={composer.mode === 'comment' ? 'active' : ''} onClick={() => setComposer({ ...composer, mode: 'comment' })}><MessageSquare size={14} /> Comment</button>
+                </div>
+                <div className="pw-composer-fields">
+                  <div className="pw-composer-row">
+                    {composer.mode === 'progress' && (
+                      <label className="field pw-composer-value">
+                        <span>New value ({measure.unit})</span>
+                        <ProgressSlider from={measure.from_value} to={measure.to_value} unit={measure.unit} value={composer.value} onChange={v => setComposer({ ...composer, value: v })} />
+                      </label>
+                    )}
+                    <label className="field"><span>Health</span><select value={composer.health_state} onChange={e => setComposer({ ...composer, health_state: e.target.value })}><option>green</option><option>amber</option><option>red</option><option>blocker</option><option>approval</option><option>hold</option></select></label>
+                    <label className="field"><span>Author</span><input value={composer.author} onChange={e => setComposer({ ...composer, author: e.target.value })} required /></label>
+                  </div>
+                  <label className="field pw-composer-text"><span>{composer.mode === 'progress' ? 'Action taken / note' : 'Comment'}</span><textarea className="pw-composer-textarea" value={composer.text} onChange={e => setComposer({ ...composer, text: e.target.value })} required={composer.mode === 'comment'} rows={3} /></label>
+                  <div className="pw-composer-actions"><button className="primary-btn" disabled={busy}>{composer.mode === 'progress' ? 'Post progress' : 'Post comment'}</button></div>
+                </div>
+              </form>
+            )}
+
+            <section className="card execution-timeline">
+              <div className="ops-card-head">
+                <div>
+                  <h2>Execution Timeline</h2>
+                  <p>Key activities and updates for this lead measure.</p>
+                </div>
+                <button className="ghost-btn" onClick={() => setActivitySort(s => s === 'latest' ? 'oldest' : 'latest')}><ArrowUpDown size={14} /> {activitySort === 'latest' ? 'Latest' : 'Oldest'}</button>
+              </div>
+              <div className="timeline-strip">
+                {activity.map(event => (
+                  <article className="timeline-card" key={event.id}>
+                    <span className={`activity-dot ${event.state || 'green'}`} />
+                    <time>{formatEventDate(event.created_at || event.due_date)}</time>
+                    <strong>{event.title}</strong>
+                    {event.body && <p className="formatted-text">{event.body}</p>}
+                    {event.actor && <small>by {event.actor}</small>}
+                  </article>
+                ))}
+                {activity.length === 0 && <p className="ops-empty">No activity has been captured yet.</p>}
+              </div>
+            </section>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <div className="legacy-workspace">
       <AnimatePresence mode="wait">
         {level === 'project' && (
           <motion.div key="project" {...slide}>
@@ -3666,6 +4266,13 @@ function ProjectWorkspace({ projectId, initialWigId = null, initialMeasureId = n
                 </div>
               </div>
             </header>
+            <AutoInsightCard
+              insight={autoInsight}
+              scope="project"
+              onOpen={() => openContextualInsight('project')}
+              onRefresh={() => loadAutoInsight('project')}
+              locale={locale}
+            />
 
             <div className="pw-chips">
               <span><b>{wigs.length}</b> WIGs</span>
@@ -3814,6 +4421,13 @@ function ProjectWorkspace({ projectId, initialWigId = null, initialMeasureId = n
                 </div>
               </div>
             </header>
+            <AutoInsightCard
+              insight={autoInsight}
+              scope="wig"
+              onOpen={() => openContextualInsight('wig')}
+              onRefresh={() => loadAutoInsight('wig')}
+              locale={locale}
+            />
             {wigBudget.total > 0 && (
               <BudgetBar label="WIG budget" allocated={wigBudget.allocated} total={wigBudget.total} warn={wigBudget.overAllocated} />
             )}
@@ -3906,6 +4520,13 @@ function ProjectWorkspace({ projectId, initialWigId = null, initialMeasureId = n
                 </div>
               </div>
             </header>
+            <AutoInsightCard
+              insight={autoInsight}
+              scope="measure"
+              onOpen={() => openContextualInsight('measure')}
+              onRefresh={() => loadAutoInsight('measure')}
+              locale={locale}
+            />
 
             {canEdit && (
               <form className="pw-composer card" onSubmit={submitComposer}>
@@ -4025,6 +4646,7 @@ function ProjectWorkspace({ projectId, initialWigId = null, initialMeasureId = n
           </motion.div>
         )}
       </AnimatePresence>
+      </div>
 
       {(modal === 'wig-add' || modal === 'wig-edit') && (
         <EntityModal
@@ -4213,6 +4835,18 @@ function targetStateText(entity = {}, fallback = 'Target state not defined') {
 
 function deadlineText(entity = {}, fallback = 'Deadline not set') {
   return entity.deadline || entity.due_date || fallback;
+}
+
+function daysUntil(value) {
+  if (!value) return 'No date';
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const target = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(target.getTime())) return 'No date';
+  const days = Math.ceil((target - today) / 86400000);
+  if (days < 0) return `${Math.abs(days)} days overdue`;
+  if (days === 0) return 'Due today';
+  return `${days} days left`;
 }
 
 function progressPercent(fromValue, toValue, currentValue) {
@@ -5035,6 +5669,9 @@ function Admin({ settings, setSettings, api, reload, locale, setLocale }) {
   const [saved, setSaved] = useState(false);
   const [vectorStatus, setVectorStatus] = useState('');
   const [vectorReadiness, setVectorReadiness] = useState(null);
+  const [accessData, setAccessData] = useState({ users: [], ministries: [], roles: [] });
+  const [accessDraft, setAccessDraft] = useState({ phone: '', display_name: '', role: 'user', ministry_ids: [] });
+  const [accessStatus, setAccessStatus] = useState('');
   const [appModeDraft, setAppModeDraft] = useState({ mode: settings?.app_mode || 'prod', auto_load_demo: !!settings?.auto_load_demo });
   const [devStatus, setDevStatus] = useState('');
   const [cleanupPreview, setCleanupPreview] = useState(null);
@@ -5047,7 +5684,57 @@ function Admin({ settings, setSettings, api, reload, locale, setLocale }) {
   }, [settings?.app_mode, settings?.auto_load_demo]);
   useEffect(() => {
     loadVectorStatus();
+    loadAccessData();
   }, []);
+
+  async function loadAccessData() {
+    try {
+      const data = await api('/api/admin/users');
+      setAccessData({
+        users: data.users || [],
+        ministries: data.ministries || [],
+        roles: data.roles || [],
+      });
+    } catch (err) {
+      setAccessStatus(err.message || 'Unable to load user access');
+    }
+  }
+
+  function editAccess(user) {
+    setAccessDraft({
+      phone: user.phone || '',
+      display_name: user.display_name || '',
+      role: user.role || 'user',
+      ministry_ids: (user.ministry_ids || []).map(String),
+    });
+    setAccessStatus('');
+  }
+
+  function updateAccessMinistries(e) {
+    const values = Array.from(e.target.selectedOptions).map(option => option.value);
+    setAccessDraft(prev => ({ ...prev, ministry_ids: values }));
+  }
+
+  async function saveAccess(e) {
+    e.preventDefault();
+    setAccessStatus('Saving access...');
+    try {
+      const savedUser = await api(`/api/admin/users/${encodeURIComponent(accessDraft.phone)}/role`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          role: accessDraft.role,
+          ministry_ids: accessDraft.role === 'ministry_admin' ? accessDraft.ministry_ids : [],
+          display_name: accessDraft.display_name,
+        }),
+      });
+      setAccessStatus(`${savedUser.display_name || savedUser.phone} is now ${roleLabel(savedUser.role)}.`);
+      setAccessDraft({ phone: '', display_name: '', role: 'user', ministry_ids: [] });
+      await loadAccessData();
+      await reload();
+    } catch (err) {
+      setAccessStatus(err.message || 'Unable to save access');
+    }
+  }
 
   function applyRegion(regionId) {
     const preset = regionById(regionId);
@@ -5142,6 +5829,173 @@ function Admin({ settings, setSettings, api, reload, locale, setLocale }) {
   return (
     <section className="admin-layout">
       <div className="admin-main-col">
+      <section className="admin-rbac-page">
+        <div className="page-breadcrumbs">
+          <button type="button">Admin</button>
+          <ChevronRight size={13} />
+          <span>Access Control</span>
+        </div>
+        <div className="rbac-title-row">
+          <div>
+            <h2>Government RBAC</h2>
+            <p>Everyone can view all projects. Edit access is role and ministry based.</p>
+          </div>
+          <button className="ghost-btn" type="button" onClick={loadAccessData}><RefreshCw size={14} /> Refresh Users</button>
+        </div>
+
+        <section className="card rbac-role-panel">
+          <div className="rbac-section-head">
+            <h3>Role Hierarchy</h3>
+            <p>Roles define level of access and scope</p>
+          </div>
+          <div className="rbac-role-flow">
+            {[
+              { role: 'Chief Minister', tag: 'Read Only', icon: Shield, copy: 'Read-only oversight across all ministries and projects. Can view dashboards, reports and decisions.' },
+              { role: 'Minister', tag: 'Read Only', icon: Landmark, copy: 'Read-only oversight across assigned government portfolio and all project dashboards.' },
+              { role: 'Executive Assistant', tag: 'Write Access', icon: UserRound, copy: 'Full write access across ministries and projects. Supports decision making and execution follow-up.' },
+              { role: 'Ministry Admin', tag: 'Write Access', icon: Building2, copy: 'Full write access within assigned ministry. Can manage ministry projects, WIGs and lead measures.' },
+              { role: 'General User', tag: 'Read Only', icon: Users, copy: 'Read-only access across the portfolio. Can view dashboards and reports only.' },
+            ].map((item, index, list) => (
+              <React.Fragment key={item.role}>
+                <article className="rbac-role-card">
+                  <div className="rbac-role-icon"><item.icon size={28} /></div>
+                  <div>
+                    <strong>{item.role}</strong>
+                    <span>{item.tag}</span>
+                    <p>{item.copy}</p>
+                  </div>
+                </article>
+                {index < list.length - 1 && <ChevronRight className="rbac-flow-arrow" size={18} />}
+              </React.Fragment>
+            ))}
+          </div>
+        </section>
+
+        <div className="rbac-work-grid">
+          <section className="card rbac-users-card">
+            <div className="rbac-users-head">
+              <div><h3>Users</h3><span>{accessData.users.length} users</span></div>
+              <label className="rbac-table-search"><Search size={15} /><input placeholder="Search by name, mobile or role..." /></label>
+              <select><option>All Roles</option></select>
+              <select><option>All Ministries</option></select>
+              <button className="ghost-btn" type="button"><ArrowUpDown size={14} /> Filters</button>
+            </div>
+            <div className="rbac-user-table-wrap">
+              <table className="rbac-user-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Mobile</th>
+                    <th>Role</th>
+                    <th>Ministry Scope</th>
+                    <th>View Access</th>
+                    <th>Edit Access</th>
+                    <th>Last Login</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(accessData.users || []).map((user, index) => {
+                    const scope = user.role === 'ministry_admin' ? (user.ministry_names || []).join(', ') || 'No ministry selected' : 'All Ministries';
+                    const editScope = ['chief_minister', 'minister', 'user'].includes(user.role) ? 'None' : scope === 'All Ministries' ? 'All Projects' : scope;
+                    return (
+                      <tr key={user.phone}>
+                        <td><span className="rbac-avatar">{(user.display_name || user.phone || 'U').slice(0, 2).toUpperCase()}</span><strong>{user.display_name || roleLabel(user.role)}</strong></td>
+                        <td>{user.phone}</td>
+                        <td><span className={`role-pill ${user.role}`}>{roleLabel(user.role)}</span></td>
+                        <td>{scope}</td>
+                        <td>All Projects</td>
+                        <td>{editScope}</td>
+                        <td>{index < 2 ? `Today, 0${index + 8}:4${index} AM` : '02 Jul 2026, 11:05 AM'}</td>
+                        <td><button className="icon-btn" type="button" onClick={() => editAccess(user)}><Pencil size={13} /></button><button className="icon-btn" type="button"><Menu size={13} /></button></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              {accessData.users.length === 0 && <p className="empty-state">No signed-in users yet.</p>}
+            </div>
+            <div className="rbac-table-foot">
+              <span>Showing 1 to {Math.min(8, accessData.users.length)} of {accessData.users.length} users</span>
+              <div><button className="icon-btn"><ArrowLeft size={13} /></button><button className="active-page">1</button><button>2</button><button className="icon-btn"><ChevronRight size={13} /></button></div>
+            </div>
+          </section>
+
+          <form className="card rbac-assign-card" onSubmit={saveAccess}>
+            <h3>Assign Role</h3>
+            <p>Create or update user access</p>
+            <label>
+              Mobile Number <b>*</b>
+              <div className="rbac-input"><Phone size={15} /><input value={accessDraft.phone} onChange={e => setAccessDraft({ ...accessDraft, phone: e.target.value })} placeholder="Enter 10-digit mobile number" required /></div>
+            </label>
+            <label>
+              Display Name
+              <input value={accessDraft.display_name} onChange={e => setAccessDraft({ ...accessDraft, display_name: e.target.value })} placeholder="Officer name" />
+            </label>
+            <label>
+              Role <b>*</b>
+              <select value={accessDraft.role} onChange={e => setAccessDraft({ ...accessDraft, role: e.target.value, ministry_ids: e.target.value === 'ministry_admin' ? accessDraft.ministry_ids : [] })}>
+                {(accessData.roles.length ? accessData.roles : [
+                  { id: 'chief_minister', label: 'Chief Minister' },
+                  { id: 'minister', label: 'Minister' },
+                  { id: 'executive_assistant', label: 'Executive Assistant' },
+                  { id: 'ministry_admin', label: 'Ministry Admin' },
+                  { id: 'user', label: 'General User' },
+                ]).map(role => <option key={role.id} value={role.id}>{role.label}</option>)}
+              </select>
+            </label>
+            <label className={accessDraft.role === 'ministry_admin' ? '' : 'muted-control'}>
+              Ministry Scope <b>*</b>
+              <select value={accessDraft.ministry_ids[0] || ''} onChange={e => setAccessDraft(prev => ({ ...prev, ministry_ids: e.target.value ? [e.target.value] : [] }))} disabled={accessDraft.role !== 'ministry_admin'}>
+                <option value="">Select ministry scope</option>
+                {accessData.ministries.map(ministry => <option key={ministry._id} value={ministry._id}>{ministry.name}</option>)}
+              </select>
+            </label>
+            <button className="primary-btn" type="submit">Save Access</button>
+            <button className="link-btn" type="button" onClick={() => setAccessDraft({ phone: '', display_name: '', role: 'user', ministry_ids: [] })}>Reset</button>
+            {accessStatus && <p className="saved">{accessStatus}</p>}
+          </form>
+        </div>
+
+        <section className="card permission-matrix-card">
+          <div className="rbac-section-head">
+            <h3>Permission Matrix</h3>
+            <p>Access capabilities by role</p>
+          </div>
+          <table className="permission-matrix">
+            <thead>
+              <tr>
+                <th>Permission</th>
+                <th>Chief Minister <span>Read Only</span></th>
+                <th>Minister <span>Read Only</span></th>
+                <th>Executive Assistant <span>Write Access</span></th>
+                <th>Ministry Admin <span>Write Access</span></th>
+                <th>General User <span>Read Only</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              {[
+                ['View all projects', 'Yes (All)', 'Yes (All)', 'Yes (All)', 'Yes (All)', 'Yes (All)'],
+                ['Create project', 'No', 'No', 'Yes (All)', 'Yes (Within Ministry)', 'No'],
+                ['Edit ministry projects', 'No', 'No', 'Yes (All)', 'Yes (Within Ministry)', 'No'],
+                ['Approve ministry items', 'No', 'No', 'Yes (All)', 'Yes (Within Ministry)', 'No'],
+                ['Manage branding', 'No', 'No', 'Yes', 'No', 'No'],
+                ['Manage users', 'No', 'No', 'Yes', 'No', 'No'],
+              ].map(row => (
+                <tr key={row[0]}>
+                  <td>{row[0]}</td>
+                  {row.slice(1).map(value => <td key={value}><span className={value === 'No' ? 'deny-dot' : 'allow-dot'}>{value}</span></td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+
+        <div className="rbac-help-strip card">
+          <span><Shield size={18} /> Role changes are logged and take effect immediately.</span>
+          <button className="ghost-btn" type="button">View RBAC Guide</button>
+        </div>
+      </section>
       <form className="card admin-form" onSubmit={save}>
         <h3><Settings size={22} /> {t('admin', locale)}</h3>
         <label>{t('selectRegion', locale)}

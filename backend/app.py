@@ -58,6 +58,21 @@ ADMIN_PHONES = {
     for phone in os.getenv("ADMIN_PHONES", "9999900000").split(",")
     if phone.strip()
 }
+CM_PHONES = {
+    normalize_phone(phone)
+    for phone in os.getenv("CM_PHONES", "").split(",")
+    if phone.strip()
+}
+EXECUTIVE_ASSISTANT_PHONES = {
+    normalize_phone(phone)
+    for phone in os.getenv("EXECUTIVE_ASSISTANT_PHONES", "").split(",")
+    if phone.strip()
+}
+GLOBAL_ADMIN_ROLES = {"executive_assistant", "admin"}
+MINISTRY_ADMIN_ROLE = "ministry_admin"
+MINISTER_ROLE = "minister"
+READ_ONLY_ROLE = "user"
+READ_ONLY_ROLES = {"chief_minister", "minister", "user"}
 DEMO_OTP_MODE = os.getenv("DEMO_OTP_MODE", "true").lower() in {"1", "true", "yes"}
 HEALTH_REFRESH_MINUTES = int(os.getenv("HEALTH_REFRESH_MINUTES", "5"))
 EMBEDDING_DIMS = 128
@@ -286,6 +301,12 @@ class AppModeIn(BaseModel):
     confirm_reseed: bool = False
 
 
+class UserRoleUpdateIn(BaseModel):
+    role: str
+    ministry_ids: list[str] = []
+    display_name: str | None = None
+
+
 REGION_CATALOG = [
     {"id": "global", "label": "Global / Multi-region", "currency": "USD", "timezone": "UTC", "org_type": "enterprise"},
     {"id": "sg", "label": "Singapore", "currency": "SGD", "timezone": "Asia/Singapore", "org_type": "public_sector"},
@@ -338,6 +359,66 @@ def token_for(user: dict[str, Any]) -> str:
     return token
 
 
+def system_role_for_phone(phone: str) -> str | None:
+    normalized = normalize_phone(phone)
+    if normalized in CM_PHONES:
+        return "chief_minister"
+    if normalized in EXECUTIVE_ASSISTANT_PHONES:
+        return "executive_assistant"
+    if normalized in ADMIN_PHONES:
+        return "admin"
+    return None
+
+
+def user_role(user: dict[str, Any] | None) -> str:
+    return (user or {}).get("role") or READ_ONLY_ROLE
+
+
+def is_global_admin(user: dict[str, Any] | None) -> bool:
+    return user_role(user) in GLOBAL_ADMIN_ROLES
+
+
+def ministry_scope_ids(user: dict[str, Any] | None) -> set[str]:
+    values = (user or {}).get("ministry_ids") or []
+    return {str(value) for value in values if value}
+
+
+def ministry_scope_names(user: dict[str, Any] | None) -> set[str]:
+    values = (user or {}).get("ministry_names") or []
+    return {str(value).strip().lower() for value in values if str(value).strip()}
+
+
+def can_edit_ministry(ministry_id: Any, ministry_name: str | None, user: dict[str, Any]) -> bool:
+    if is_global_admin(user):
+        return True
+    if user_role(user) != MINISTRY_ADMIN_ROLE:
+        return False
+    ministry_id_text = str(ministry_id or "")
+    if ministry_id_text and ministry_id_text in ministry_scope_ids(user):
+        return True
+    name = (ministry_name or "").strip().lower()
+    return bool(name and name in ministry_scope_names(user))
+
+
+def permission_payload(user: dict[str, Any], project: dict[str, Any] | None = None) -> dict[str, Any]:
+    role = user_role(user)
+    payload = {
+        "role": role,
+        "is_global_admin": is_global_admin(user),
+        "is_ministry_admin": role == MINISTRY_ADMIN_ROLE,
+        "ministry_ids": list(ministry_scope_ids(user)),
+        "ministry_names": sorted(ministry_scope_names(user)),
+        "can_manage_users": is_global_admin(user),
+        "can_manage_branding": is_global_admin(user),
+        "can_create_project": is_global_admin(user) or role == MINISTRY_ADMIN_ROLE,
+        "can_view_all_projects": True,
+    }
+    if project is not None:
+        payload["can_edit"] = can_edit_project(project, user)
+        payload["can_edit_ministry"] = can_edit_ministry(project.get("ministry_id"), project.get("ministry"), user)
+    return payload
+
+
 def current_user(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing session")
@@ -356,15 +437,15 @@ def current_user(authorization: str | None = Header(default=None)) -> dict[str, 
 
 
 def require_admin(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if not is_global_admin(user):
+        raise HTTPException(status_code=403, detail="Executive Assistant access required")
     return user
 
 
 def can_edit_project(project: dict[str, Any], user: dict[str, Any]) -> bool:
-    if user.get("role") == "admin":
-        return True
-    if DEMO_OTP_MODE:
+    if user_role(user) in READ_ONLY_ROLES:
+        return False
+    if can_edit_ministry(project.get("ministry_id"), project.get("ministry"), user):
         return True
     phone = user.get("phone")
     return bool(phone and (project.get("created_by") == phone or phone in project.get("authorized_users", [])))
@@ -3481,10 +3562,14 @@ def verify_otp(payload: VerifyRequest) -> dict[str, Any]:
     created_at = record.get("created_at")
     if created_at and created_at < datetime.utcnow() - timedelta(minutes=10):
         raise HTTPException(status_code=400, detail="OTP expired")
-    role = "admin" if phone in ADMIN_PHONES else "user"
+    existing_user = db.users.find_one({"phone": phone})
+    role = system_role_for_phone(phone) or (existing_user.get("role") if existing_user else READ_ONLY_ROLE)
     db.users.update_one(
         {"phone": phone},
-        {"$set": {"phone": phone, "role": role, "updated_at": datetime.utcnow()}, "$setOnInsert": {"created_at": datetime.utcnow()}},
+        {
+            "$set": {"phone": phone, "role": role, "updated_at": datetime.utcnow()},
+            "$setOnInsert": {"created_at": datetime.utcnow(), "ministry_ids": [], "ministry_names": []},
+        },
         upsert=True,
     )
     db.otp_requests.update_one({"_id": record["_id"]}, {"$set": {"used": True}})
@@ -3495,8 +3580,8 @@ def verify_otp(payload: VerifyRequest) -> dict[str, Any]:
 
 @app.get("/api/auth/me")
 def auth_me(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    role = "admin" if user.get("phone") in ADMIN_PHONES else "user"
-    if user.get("role") != role:
+    role = system_role_for_phone(user.get("phone", "")) or user_role(user)
+    if user_role(user) != role:
         db.users.update_one({"_id": user["_id"]}, {"$set": {"role": role, "updated_at": datetime.utcnow()}})
         user = db.users.find_one({"_id": user["_id"]})
     return {"user": clean_id(user)}
@@ -3506,6 +3591,10 @@ def auth_me(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
 def overview(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     refresh_all_project_health()
     projects = [clean_id(doc) for doc in db.projects.find().sort("health_score", 1)]
+    raw_projects = list(db.projects.find().sort("health_score", 1))
+    project_permissions = {str(project["_id"]): permission_payload(user, project) for project in raw_projects}
+    for project in projects:
+        project["permissions"] = project_permissions.get(str(project.get("_id")), permission_payload(user))
     ministries = [clean_id(doc) for doc in db.ministries.find().sort("name", 1)]
     assignments = [clean_id(doc) for doc in db.assignments.find({"status": {"$ne": "Done"}}).sort("due_date", 1).limit(8)]
     decisions = [clean_id(doc) for doc in db.decisions.find({"status": "Pending"}).sort("due_date", 1).limit(8)]
@@ -3537,6 +3626,7 @@ def overview(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
         ],
         "health_trend": portfolio_health_trend(),
         "pending_approvals": db.approvals.count_documents({"status": "Pending"}),
+        "permissions": permission_payload(user),
     }
 
 
@@ -3584,7 +3674,12 @@ def list_ministries(user: dict[str, Any] = Depends(current_user)) -> list[dict[s
 @app.get("/api/projects")
 def list_projects(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
     refresh_all_project_health()
-    return [clean_id(doc) for doc in db.projects.find().sort("health_score", 1)]
+    rows = []
+    for doc in db.projects.find().sort("health_score", 1):
+        row = clean_id(doc)
+        row["permissions"] = permission_payload(user, doc)
+        rows.append(row)
+    return rows
 
 
 @app.post("/api/projects")
@@ -3592,6 +3687,8 @@ def create_project(payload: ProjectIn, user: dict[str, Any] = Depends(current_us
     ministry = db.ministries.find_one({"_id": oid(payload.ministry_id)})
     if not ministry:
         raise HTTPException(status_code=404, detail="Ministry not found")
+    if not can_edit_ministry(ministry["_id"], ministry.get("name"), user):
+        raise HTTPException(status_code=403, detail="You can create projects only in your assigned ministry")
     initial_wig = (payload.wig or "").strip()
     wigs = []
     if initial_wig:
@@ -3807,6 +3904,7 @@ def update_lead_measure_progress(project_id: str, wig_id: str, measure_id: str, 
     project = db.projects.find_one({"_id": oid(project_id)})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    require_project_editor(project, user)
     wig = find_wig(project, wig_id)
     if not wig:
         raise HTTPException(status_code=404, detail="WIG not found")
@@ -3849,6 +3947,7 @@ def add_lead_measure_comment(project_id: str, wig_id: str, measure_id: str, payl
     project = db.projects.find_one({"_id": oid(project_id)})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    require_project_editor(project, user)
     comment = payload.model_dump()
     comment["health_state"] = state
     comment["id"] = str(uuid.uuid4())
@@ -3926,7 +4025,7 @@ def project_evidence(project_id: str, user: dict[str, Any] = Depends(current_use
         "notifications": notifications,
         "meetings": meetings,
         "audit": audit,
-        "permissions": {"can_edit": can_edit_project(project, user), "role": user.get("role")},
+        "permissions": permission_payload(user, project),
     }
 
 
@@ -3935,6 +4034,7 @@ def request_approval(payload: ApprovalIn, user: dict[str, Any] = Depends(current
     project = db.projects.find_one({"_id": oid(payload.project_id)})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    require_project_editor(project, user)
     wig = find_wig(project, payload.wig_id)
     if not wig or not find_measure(wig, payload.measure_id):
         raise HTTPException(status_code=404, detail="WIG or lead measure not found")
@@ -3972,6 +4072,7 @@ def create_weekly_meeting(payload: WeeklyMeetingIn, user: dict[str, Any] = Depen
     project = db.projects.find_one({"_id": oid(payload.project_id)})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    require_project_editor(project, user)
     doc = payload.model_dump()
     doc["project_id"] = project["_id"]
     doc["ministry_id"] = project["ministry_id"]
@@ -4072,6 +4173,11 @@ def meeting_to_action_apply(project_id: str, payload: MeetingToActionApplyIn, us
 
 @app.post("/api/ministries/{ministry_id}/meeting-to-action/apply")
 def ministry_meeting_to_action_apply(ministry_id: str, payload: MeetingToActionApplyIn, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    ministry = db.ministries.find_one({"_id": oid(ministry_id)})
+    if not ministry:
+        raise HTTPException(status_code=404, detail="Ministry not found")
+    if not can_edit_ministry(ministry["_id"], ministry.get("name"), user):
+        raise HTTPException(status_code=403, detail="Ministry editor access required")
     payload_data = payload.model_dump()
     try:
         result = apply_ministry_meeting_to_action(
@@ -4118,6 +4224,7 @@ def add_document(payload: DocumentIn, user: dict[str, Any] = Depends(current_use
     project = db.projects.find_one({"_id": oid(payload.project_id)})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    require_project_editor(project, user)
     doc = insert_document(project["_id"], project["ministry_id"], payload.title, payload.document_type, payload.content, user["phone"], payload.wig_id, payload.measure_id)
     refreshed = refresh_project_health(project["_id"])
     return {"document": clean_id(doc), "project": clean_id(refreshed)}
@@ -4135,6 +4242,7 @@ async def upload_document(
     project = db.projects.find_one({"_id": oid(project_id)})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    require_project_editor(project, user)
     raw = await file.read()
     filename = file.filename or "Uploaded Document"
     content, file_meta = extract_uploaded_file_text(raw, filename, file.content_type)
@@ -4191,6 +4299,7 @@ def create_assignment(payload: AssignmentIn, user: dict[str, Any] = Depends(curr
     project = db.projects.find_one({"_id": oid(payload.project_id)})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    require_project_editor(project, user)
     doc = payload.model_dump()
     doc["project_id"] = project["_id"]
     doc["ministry_id"] = project["ministry_id"]
@@ -4204,10 +4313,14 @@ def create_assignment(payload: AssignmentIn, user: dict[str, Any] = Depends(curr
 
 @app.put("/api/assignments/{assignment_id}/status")
 def update_assignment_status(assignment_id: str, status: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    db.assignments.update_one({"_id": oid(assignment_id)}, {"$set": {"status": status, "updated_by": user["phone"], "updated_at": datetime.utcnow()}})
     doc = db.assignments.find_one({"_id": oid(assignment_id)})
     if not doc:
         raise HTTPException(status_code=404, detail="Assignment not found")
+    project = db.projects.find_one({"_id": doc.get("project_id")})
+    if project:
+        require_project_editor(project, user)
+    db.assignments.update_one({"_id": oid(assignment_id)}, {"$set": {"status": status, "updated_by": user["phone"], "updated_at": datetime.utcnow()}})
+    doc = db.assignments.find_one({"_id": oid(assignment_id)})
     return clean_id(doc)
 
 
@@ -4252,6 +4365,7 @@ def create_decision(payload: DecisionIn, user: dict[str, Any] = Depends(current_
     project = db.projects.find_one({"_id": oid(payload.project_id)})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    require_project_editor(project, user)
     doc = payload.model_dump()
     doc["project_id"] = project["_id"]
     doc["ministry_id"] = project["ministry_id"]
@@ -4265,11 +4379,67 @@ def create_decision(payload: DecisionIn, user: dict[str, Any] = Depends(current_
 
 @app.put("/api/decisions/{decision_id}/status")
 def update_decision_status(decision_id: str, status: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    db.decisions.update_one({"_id": oid(decision_id)}, {"$set": {"status": status, "updated_by": user["phone"], "updated_at": datetime.utcnow()}})
     doc = db.decisions.find_one({"_id": oid(decision_id)})
     if not doc:
         raise HTTPException(status_code=404, detail="Decision not found")
+    project = db.projects.find_one({"_id": doc.get("project_id")})
+    if project:
+        require_project_editor(project, user)
+    db.decisions.update_one({"_id": oid(decision_id)}, {"$set": {"status": status, "updated_by": user["phone"], "updated_at": datetime.utcnow()}})
+    doc = db.decisions.find_one({"_id": oid(decision_id)})
     return clean_id(doc)
+
+
+@app.get("/api/admin/users")
+def list_users(admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    ministries = [clean_id(doc) for doc in db.ministries.find().sort("name", 1)]
+    users = [clean_id(doc) for doc in db.users.find().sort("updated_at", -1)]
+    for user in users:
+        user["permissions"] = permission_payload(user)
+    return {
+        "users": users,
+        "ministries": ministries,
+        "roles": [
+            {"id": "chief_minister", "label": "Chief Minister"},
+            {"id": "minister", "label": "Minister"},
+            {"id": "executive_assistant", "label": "Executive Assistant"},
+            {"id": "ministry_admin", "label": "Ministry Admin"},
+            {"id": "user", "label": "General User"},
+        ],
+    }
+
+
+@app.put("/api/admin/users/{phone}/role")
+def update_user_role(phone: str, payload: UserRoleUpdateIn, admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    normalized = normalize_phone(phone)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Mobile number is required")
+    allowed = {"chief_minister", "minister", "executive_assistant", "ministry_admin", "user", "admin"}
+    if payload.role not in allowed:
+        raise HTTPException(status_code=400, detail="Unsupported role")
+    ministry_ids: list[ObjectId] = []
+    ministry_names: list[str] = []
+    if payload.role == MINISTRY_ADMIN_ROLE:
+        if not payload.ministry_ids:
+            raise HTTPException(status_code=400, detail="Select at least one ministry for Ministry Admin")
+        ministries = list(db.ministries.find({"_id": {"$in": [oid(mid) for mid in payload.ministry_ids]}}))
+        if len(ministries) != len(payload.ministry_ids):
+            raise HTTPException(status_code=400, detail="One or more ministries were not found")
+        ministry_ids = [item["_id"] for item in ministries]
+        ministry_names = [item["name"] for item in ministries]
+    patch = {
+        "phone": normalized,
+        "role": payload.role,
+        "ministry_ids": ministry_ids,
+        "ministry_names": ministry_names,
+        "display_name": payload.display_name or "",
+        "updated_by": admin["phone"],
+        "updated_at": datetime.utcnow(),
+    }
+    db.users.update_one({"phone": normalized}, {"$set": patch, "$setOnInsert": {"created_at": datetime.utcnow()}}, upsert=True)
+    user = clean_id(db.users.find_one({"phone": normalized}))
+    user["permissions"] = permission_payload(user)
+    return user
 
 
 @app.get("/api/admin/llm-status")
